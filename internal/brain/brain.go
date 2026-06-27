@@ -1,0 +1,189 @@
+// Copyright 2026 Scott Friedman
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// Package brain plans, proposes, and interprets experiments; it never accepts.
+// Work is organized as a result-gated ladder of rungs ordered cheapest-first.
+// Only the first rung runs on the human's "Go"; the brain proposes climbing
+// only when a lower rung warrants it, recommends stopping on honest negatives,
+// and never advances a rung or declares success on its own. The human at "Go"
+// is the sole acceptance node. See ARCHITECTURE.md §6.2 and CLAUDE.md.
+package brain
+
+import (
+	"context"
+	"fmt"
+
+	"github.com/scttfrdmn/foray/internal/sizing"
+)
+
+// Question is the load-bearing invariant: the user writes a question, not a
+// structure, and every rung serves it. BudgetUSD is the per-question envelope
+// the brain enforces across the whole ladder (distinct from Cedar's per-session
+// ceiling — both hold).
+type Question struct {
+	Text      string
+	BudgetUSD float64
+}
+
+// Rung is one experiment in the ladder: a model + technique + engine + sized
+// hardware + cost estimate, plus the nnsight the worker will run.
+type Rung struct {
+	Index      int
+	Technique  string
+	Model      sizing.Model
+	Rationale  string
+	NNSight    string
+	Engine     sizing.Engine
+	Options    []sizing.Option // hardware that fits, tightest-first
+	Chosen     sizing.Option   // the option the brain picked (Options[0])
+	EstCostUSD float64
+}
+
+// Ladder is the ordered, cheapest-first plan for a question. Cursor is the next
+// un-run rung; Spent accumulates approved cost against Question.BudgetUSD.
+type Ladder struct {
+	Question Question
+	Rungs    []Rung
+	Cursor   int
+	Spent    float64
+}
+
+// Proposal is what the brain puts in front of the human. Exactly one of Clarify
+// (a question back to the user when the ask underdetermines the experiment) or
+// Rung (the next experiment awaiting "Go") is set.
+type Proposal struct {
+	Clarify string
+	Rung    *Rung
+}
+
+// Result is the outcome of running a rung, framed against the question.
+type Result struct {
+	Rung    int
+	VizRef  string
+	Finding string
+}
+
+// Decision is the brain's post-result recommendation. It is advice, never an
+// action — the human decides whether to climb.
+type Decision string
+
+const (
+	Climb Decision = "climb"
+	Stop  Decision = "stop"
+)
+
+// Recommendation pairs a Decision with a reason tied to the finding and the
+// question.
+type Recommendation struct {
+	Decision Decision
+	Reason   string
+}
+
+// Planner produces a ladder from a question, or a clarifying proposal when the
+// ask is underdetermined. Backed by Bedrock AgentCore in prod; a fake offline.
+type Planner interface {
+	PlanLadder(ctx context.Context, question string) (*Ladder, *Proposal, error)
+}
+
+// Policy gates a rung before it runs (Cedar in prod). On deny it returns a
+// reason that surfaces verbatim to the user.
+type Policy interface {
+	Permit(ctx context.Context, r *Rung) (ok bool, reason string)
+}
+
+// Executor launches the approved rung and returns a session id (spawn in prod).
+type Executor interface {
+	Execute(ctx context.Context, q Question, r *Rung) (sessionID string, err error)
+}
+
+// Brain wires the three seams. It proposes and interprets; Approve (the human's
+// "Go") is the only place a rung runs.
+type Brain struct {
+	Plan   Planner
+	Policy Policy
+	Exec   Executor
+}
+
+// Propose plans the ladder for a question and returns the first thing to put in
+// front of the human: either a clarifying question or the first rung. It does
+// not run anything.
+func (b *Brain) Propose(ctx context.Context, question string) (*Ladder, *Proposal, error) {
+	ladder, prop, err := b.Plan.PlanLadder(ctx, question)
+	if err != nil {
+		return nil, nil, fmt.Errorf("plan ladder: %w", err)
+	}
+	// A clarifying proposal short-circuits: there is no ladder to climb yet.
+	if prop != nil && prop.Clarify != "" {
+		return ladder, prop, nil
+	}
+	if ladder == nil || len(ladder.Rungs) == 0 {
+		return nil, nil, fmt.Errorf("planner returned no rungs and no clarification")
+	}
+	ladder.Cursor = 0
+	return ladder, &Proposal{Rung: &ladder.Rungs[0]}, nil
+}
+
+// Approve is the HITL acceptance node: the human said "Go" to this rung. It
+// checks policy, launches the rung, advances the cursor, and books the spend.
+// Nothing runs without passing through here.
+func (b *Brain) Approve(ctx context.Context, l *Ladder, p *Proposal) (string, error) {
+	if p == nil || p.Rung == nil {
+		return "", fmt.Errorf("approve: nil proposal")
+	}
+	if ok, reason := b.Policy.Permit(ctx, p.Rung); !ok {
+		return "", fmt.Errorf("policy denied rung %d: %s", p.Rung.Index, reason)
+	}
+	sid, err := b.Exec.Execute(ctx, l.Question, p.Rung)
+	if err != nil {
+		return "", fmt.Errorf("execute rung %d: %w", p.Rung.Index, err)
+	}
+	l.Cursor++
+	l.Spent += p.Rung.EstCostUSD
+	return sid, nil
+}
+
+// Assess interprets a rung's result and recommends climbing or stopping. It is
+// a recommendation only — the brain never advances the ladder or declares
+// success itself. It stops at the top of the ladder, stops when the next rung
+// would exceed the per-question envelope, and (in prod) stops on an honest
+// negative rather than paying to confirm nothing.
+func (b *Brain) Assess(ctx context.Context, l *Ladder, res *Result) (*Recommendation, error) {
+	next := res.Rung + 1
+	if next >= len(l.Rungs) {
+		return &Recommendation{Decision: Stop, Reason: "answered — the ladder is complete"}, nil
+	}
+	// Honest-negative hook: a real assessor stops here when the lower rung showed
+	// no effect ("likely absent — don't pay to confirm nothing"). The fake's
+	// findings are always positive, so it climbs.
+	if l.Spent+l.Rungs[next].EstCostUSD > l.Question.BudgetUSD {
+		return &Recommendation{
+			Decision: Stop,
+			Reason: fmt.Sprintf("budget envelope: next rung (~$%.2f) would exceed the $%.2f left for this question",
+				l.Rungs[next].EstCostUSD, l.Question.BudgetUSD-l.Spent),
+		}, nil
+	}
+	return &Recommendation{
+		Decision: Climb,
+		Reason:   "the lower rung warrants confirming the effect scales",
+	}, nil
+}
+
+// NextProposal returns the next un-run rung as a proposal, or nil if the ladder
+// is exhausted. Climbing is always a fresh proposal awaiting another "Go".
+func (b *Brain) NextProposal(ctx context.Context, l *Ladder) *Proposal {
+	if l.Cursor < 0 || l.Cursor >= len(l.Rungs) {
+		return nil
+	}
+	return &Proposal{Rung: &l.Rungs[l.Cursor]}
+}

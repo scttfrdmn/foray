@@ -13,6 +13,28 @@ prefix.
 
 ### Added
 
+- `internal/device`: accelerator/instance registry — `Tier` (slice/small/mid/
+  large), `Backend`, `Option`, `Provider`, `Lookup`, and `Options(minHBM)` which
+  returns enabled NVIDIA tiers that fit, sorted ascending. `neuron` is
+  registered but GA-gated (disabled, never surfaced).
+- `internal/sizing`: `Size(model, intervention)` → footprint + ranked hardware
+  options. Engine routing (gradients/per-layer saves → eager; large prompt sweep
+  → vLLM), residual-stream and KV-pool memory math.
+- `internal/brain`: the result-gated ladder core — `Brain`, `Ladder`, `Rung`,
+  `Question`, `Proposal`, `Result`, `Recommendation`, the Planner/Policy/Executor
+  seams, and `Propose`/`Approve`/`Assess`/`NextProposal`. The human "Go"
+  (`Approve`) is the only place a rung runs.
+- **`make demo-fake` now walks the full loop end-to-end offline** (intent → plan
+  → Go → run → assess → climb → receipt), zero AWS — the MVP definition of done.
+
+### Changed
+
+- CI: `go test ./...`, `go build ./...`/`go vet ./...`, and `make demo-fake` are
+  now hard gates (dropped `continue-on-error`); `.golangci.yml` migrated to the
+  v2 schema.
+
+### Project bootstrap
+
 - Project bootstrap: Apache 2.0 `LICENSE` + `NOTICE`, license headers on every
   source file.
 - Go module `github.com/scttfrdmn/foray` (Go 1.26) and the
@@ -33,12 +55,9 @@ prefix.
 
 ### Notes
 
-- The core packages (`device`, `sizing`, `catalog`, `brain` real path,
-  `gateway`/`forayd`, `worker`, `spore` adapters, `deploy`) are not yet
-  implemented; their work is tracked in GitHub milestones and issues. As a
-  result `go build ./...` and `go test ./...` are intentionally not green at
-  this stage — only `internal/export` builds standalone; `brain` and
-  `cmd/foray` await `internal/sizing`. The static page (`web/`) runs the full
-  loop today.
+- The whole tree now builds and `go test ./...` passes. The AWS-touching pieces
+  (`catalog`, the real non-fake `brain` path, `gateway`/`forayd`, `worker`,
+  `spore` adapters, `deploy`) are not yet implemented; their work is tracked in
+  GitHub milestones and issues.
 
 [Unreleased]: https://github.com/scttfrdmn/foray/commits/main
