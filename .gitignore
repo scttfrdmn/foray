@@ -23,6 +23,13 @@ vendor/
 # Worker image build context
 worker/_build/
 
+# Python (the worker)
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.venv/
+
 # Editor / OS
 .DS_Store
 .idea/

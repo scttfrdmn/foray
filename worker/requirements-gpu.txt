@@ -1,0 +1,13 @@
+# GPU stack — NOT installed in CI (no GPU there). Installed only in the worker
+# image and on the manual smoke instance. Imported lazily inside worker/engine.py,
+# worker/loader.py, worker/saves.py so the base path never needs them.
+# Copyright 2026 Scott Friedman. Apache License 2.0.
+-r requirements.txt
+torch>=2.5
+nnsight>=0.4
+vllm>=0.6
+transformers>=4.46
+safetensors>=0.4
+# GPUDirect Storage fast path (S3 -> HBM). Optional at runtime: loader.py falls
+# back to a plain download when kvikio/cuFile isn't present.
+kvikio-cu12>=24.10
