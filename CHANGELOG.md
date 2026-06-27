@@ -40,6 +40,19 @@ prefix.
   (step 4) will drive so a model-holding worker isn't reaped between traces.
   Resolves how foray depends on spore.host (issue #41): shell out, no Go-module
   dependency — documented in the package doc.
+- `internal/gateway` (`forayd`): the one load-bearing new contract. `Gateway.Route`
+  resolves a session, bridges per-session `last_request_time` into spawn's idle
+  signal (via `spore.Spawn.KeepWarm`) so a model-holding-HBM worker isn't reaped
+  between traces, then forwards the serialized nnsight graph to the live worker —
+  returning only references (`s3://` save ref + viz ref), never tensors (no
+  automatic egress). `Store`/`Worker` seams (in-memory + `HTTPWorker` now;
+  DynamoDB-backed store deferred to deploy). `Handler` serves
+  `POST /sessions/{id}/trace` and `GET /healthz` (liveness + freshest
+  `last_request_time`) on a stdlib `ServeMux`. `NewFake` runs it all with zero
+  AWS for `FORAY_FAKE=1`. Closes #11, #12, #46.
+- `cmd/forayd`: thin entrypoint wrapping `Gateway.Handler` in an `http.Server`
+  for local/dev and rehearsal; per-invocation gateway logic (no daemon state) so
+  it drops onto a cold Lambda and the control plane rests at ~$0.
 
 ### Changed
 
