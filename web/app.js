@@ -14,40 +14,38 @@
  * limitations under the License.
  */
 
-/* foray — the loop, client-side, canned (mirrors `make demo-fake`).
-   Question -> proposed rung -> Go -> logit-lens resolves -> finding -> assess ->
-   climb -> receipt, with opt-in export. No backend; all state in memory. */
+/* foray — the page as a thin client over the brain loop (internal/webapi).
+   Question -> POST /api/propose -> proposed rung -> Go -> POST /api/approve
+   (Cedar-gated launch, trace, interpret, assess) -> finding + recommendation ->
+   climb on a fresh Go -> receipt, with opt-in export. The brain proposes and
+   interprets; only Go (an /api/approve POST) launches; climbing is never
+   automatic. Under `make web-fake` the server runs the offline fake loop, so the
+   same page rehearses with no AWS — the rehearsal badge stays honest.
+
+   The page owns only the Go seam and the viz: every number and finding comes from
+   the server. The strata panel is an illustrative logit-lens seeded from the
+   rung's real layer count; the rendered pixels arrive via vizRef at the deploy
+   step (the polished viz is deferred, ARCHITECTURE.md §9). */
 
 "use strict";
 
-const PROMPT = "The Eiffel Tower is in the city of";
-const DISTRACTORS = ["the", "France", "a", "central", "French", "north", "Europe", "the", "a"];
-
-const RUNGS = [
-  {
-    n: 0, model: "openai-community/gpt2", layers: 12, resolveAt: 9, finalProb: 0.41,
-    technique: "logit-lens", engine: "eager",
-    hardware: "g7e MIG slice", gpu: "RTX PRO 6000 · 24GB", cost: 0.02,
-    why: "cheapest model that could show the effect — cents to find out",
-    nnsight: 'with model.trace("The Eiffel Tower is in the city of"):\n    layers = [model.transformer.h[i].output[0].save() for i in range(12)]',
-    finding: "Top token sharpens to \u201cParis\u201d by layer 9 (p\u22480.41). The association is present even in a toy model.",
-    assess: { decision: "climb", reason: "suggestive in GPT-2 \u2014 confirm it scales to 8B" },
-    session: "fake-session-r0"
-  },
-  {
-    n: 1, model: "meta-llama/Llama-3.1-8B", layers: 32, resolveAt: 20, finalProb: 0.78,
-    technique: "logit-lens", engine: "eager",
-    hardware: "g7 whole card", gpu: "RTX PRO 4500 · 32GB", cost: 0.20,
-    why: "confirm the effect scales beyond a toy model",
-    nnsight: 'with model.trace("The Eiffel Tower is in the city of"):\n    layers = [model.model.layers[i].output[0].save() for i in range(32)]',
-    finding: "\u201cParis\u201d emerges around layer 20 (p\u22480.78) \u2014 stronger and earlier-resolved. The effect scales.",
-    assess: { decision: "stop", reason: "answered \u2014 the association holds and strengthens with scale" },
-    session: "fake-session-r1"
-  }
-];
-
 const REDUCED = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
 const $ = (s, r = document) => r.querySelector(s);
+
+/* ---- API ---- */
+async function api(path, body) {
+  const resp = await fetch(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  let data = {};
+  try { data = await resp.json(); } catch { /* empty/non-JSON body */ }
+  if (!resp.ok) {
+    throw new Error(data.error || `request failed (${resp.status})`);
+  }
+  return data;
+}
 
 /* ---- probability colormap (inferno-ish), t in [0,1] ---- */
 const STOPS = ["#2A2250", "#7A2E83", "#C03A6E", "#F0852E", "#FBD08A"].map(hexRGB);
@@ -60,34 +58,34 @@ function ramp(t) {
   return `rgb(${c[0]},${c[1]},${c[2]})`;
 }
 
-/* ---- synth a per-layer logit-lens curve ---- */
-function strata(rung) {
+/* ---- synth an illustrative per-layer confidence curve ---- */
+/* Seeded from the rung's real layer count; the shape (a sigmoid resolving about
+   two-thirds of the way up) illustrates a logit lens. It is NOT the real result —
+   the finding text below it is. The rendered pixels arrive via vizRef at deploy. */
+function strata(layers) {
+  const n = Math.max(1, layers | 0);
+  const resolveAt = Math.round(n * 0.66);
+  const finalProb = 0.8;
   const out = [];
-  for (let L = 0; L < rung.layers; L++) {
-    const p = rung.finalProb / (1 + Math.exp(-(L - rung.resolveAt) * 0.8));
-    const hit = L >= rung.resolveAt - 2;
-    out.push({
-      ly: L,
-      tok: hit ? "Paris" : DISTRACTORS[L % DISTRACTORS.length],
-      prob: Math.max(0.01, p),
-      hit
-    });
+  for (let L = 0; L < n; L++) {
+    const p = finalProb / (1 + Math.exp(-(L - resolveAt) * 0.8));
+    out.push({ ly: L, prob: Math.max(0.01, p), hit: L >= resolveAt - 2 });
   }
   return out;
 }
 
 /* ---- render a strata panel into a container, animate the reveal ---- */
-function renderStrata(host, rung, compact) {
+function renderStrata(host, layers, compact) {
   host.innerHTML = "";
-  const rows = strata(rung);
+  const rows = strata(layers);
   const maxP = Math.max(...rows.map(r => r.prob)); // brightest row anchors the ramp
   rows.forEach((r, idx) => {
     const t = r.prob / maxP; // 0..1 confidence within this panel
     const el = document.createElement("div");
     el.className = "row" + (r.hit ? " hit" : "");
+    el.setAttribute("aria-hidden", "true"); // decorative; the finding text is the content
     el.innerHTML =
       `<span class="ly">${r.ly}</span>` +
-      `<span class="tok">${r.tok}</span>` +
       `<span class="track"><span class="fill"></span></span>` +
       `<span class="pct">${(r.prob * 100).toFixed(0)}%</span>`;
     host.appendChild(el);
@@ -105,122 +103,204 @@ function renderStrata(host, rung, compact) {
   return (REDUCED ? 0 : 90 + rows.length * (compact ? 26 : 55)) + 500;
 }
 
-/* ---- header cost meter ---- */
-let spent = 0;
-function addCost(c) {
-  spent += c;
+/* ---- header cost meter: bound to the server's numbers, never a client sum ---- */
+function setMeter(spentUSD) {
   const v = $("#meter-val");
-  v.textContent = "$" + spent.toFixed(2);
+  v.textContent = "$" + Number(spentUSD || 0).toFixed(2);
   v.classList.add("tick");
   setTimeout(() => v.classList.remove("tick"), 350);
 }
 
-/* ---- hero preview: rung 0 resolving on load ---- */
+/* ---- hero preview: a static, decorative logit-lens illustration on load ---- */
 function heroPreview() {
-  $("#hero-prompt").innerHTML = "\u201cThe Eiffel Tower is in the city of\u201d \u2192 <b>Paris</b>";
-  $("#hero-foot").textContent = "gpt2 \u00b7 12 layers \u00b7 reading the residual stream";
-  renderStrata($("#hero-strata"), RUNGS[0], false);
+  $("#hero-prompt").innerHTML = "per-layer confidence climbs as the model resolves an answer";
+  $("#hero-foot").textContent = "illustrative logit lens · the rendered viz arrives from your own GPU";
+  renderStrata($("#hero-strata"), 12, false);
 }
 
 /* ---- the loop ---- */
-let cursor = 0;
+let currentLadder = null; // the carried server state; the client echoes it back
+
+function esc(s) { return String(s).replace(/[&<>]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c])); }
 
 function rungCard(rung) {
   const li = document.createElement("li");
   li.className = "rung";
-  li.id = "rung-" + rung.n;
+  li.id = "rung-" + rung.index;
+  const hw = [rung.hardware, rung.gpu].filter(Boolean).join(" · ") || "—";
   li.innerHTML = `
     <div class="rung-head">
-      <span class="rung-no">rung ${rung.n}</span>
-      <span class="rung-model">${rung.model}</span>
-      <span class="rung-why">${rung.why}</span>
+      <span class="rung-no">rung ${rung.index}</span>
+      <span class="rung-model">${esc(rung.model)}</span>
+      <span class="rung-why">${esc(rung.rationale)}</span>
     </div>
     <dl class="spec">
-      <dt>technique</dt><dd>${rung.technique}</dd>
-      <dt>engine</dt><dd>${rung.engine}</dd>
-      <dt>hardware</dt><dd>${rung.hardware} \u00b7 ${rung.gpu}</dd>
-      <dt>cost</dt><dd class="cost">~$${rung.cost.toFixed(2)} / session</dd>
+      <dt>technique</dt><dd>${esc(rung.technique)}</dd>
+      <dt>engine</dt><dd>${esc(rung.engine)}</dd>
+      <dt>hardware</dt><dd>${esc(hw)}${rung.instance ? " · " + esc(rung.instance) : ""}</dd>
+      <dt>cost</dt><dd class="cost">~$${Number(rung.estCostUSD).toFixed(2)} / session</dd>
     </dl>
-    <details class="nn"><summary>the nnsight it will run</summary><pre>${rung.nnsight.replace(/</g, "&lt;")}</pre></details>
+    <details class="nn"><summary>the nnsight it will run</summary><pre>${esc(rung.nnsight)}</pre></details>
     <div class="rung-actions">
-      <button class="go" data-n="${rung.n}">Go</button>
-      <span class="go-note" style="font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--faint)">approve this rung \u2014 nothing launches until you do</span>
+      <button class="go" data-n="${rung.index}">Go</button>
+      <span class="go-note">approve this rung — nothing launches until you do</span>
     </div>
     <div class="run-result" hidden>
-      <figure class="lens lens--compact"><div class="strata"></div><div class="lens-foot"></div></figure>
-      <p class="finding"></p>
+      <figure class="lens lens--compact" role="img" aria-label="logit-lens illustration">
+        <div class="strata"></div>
+        <div class="lens-foot"></div>
+      </figure>
+      <p class="finding" role="status" aria-live="polite"></p>
       <div class="assess"></div>
       <div class="export" hidden>
         <span class="lbl">your data</span>
         <button class="btn-ghost dl" data-kind="activations">Download activations</button>
         <button class="btn-ghost dl" data-kind="bundle">Download bundle</button>
-        <span class="export-note">Stays in your region by default. Export is a presigned pull from your own bucket \u2014 <code>foray export ${rung.session}</code></span>
+        <span class="export-note"></span>
       </div>
     </div>`;
   $(".go", li).addEventListener("click", () => runRung(rung, li));
-  li.querySelectorAll(".dl").forEach(b =>
-    b.addEventListener("click", () => downloadStub(rung, b.dataset.kind, li)));
   return li;
 }
 
-function runRung(rung, li) {
+async function runRung(rung, li) {
   const btn = $(".go", li);
-  btn.disabled = true; btn.textContent = "Go \u2713";
-  $(".go-note", li).textContent = "running on " + rung.hardware + " \u2026";
-  addCost(rung.cost);
+  btn.disabled = true;
+  btn.setAttribute("aria-busy", "true");
+  btn.textContent = "Go ✓";
+  const note = $(".go-note", li);
+  note.textContent = "launching on " + (rung.hardware || rung.instance || "the chosen tier") + " …";
 
   const result = $(".run-result", li);
   result.hidden = false;
-  $(".lens-foot", result).textContent = rung.model + " \u00b7 " + rung.layers + " layers \u00b7 resolving \u2026";
-  const settle = renderStrata($(".strata", result), rung, true);
+  const foot = $(".lens-foot", result);
+  foot.textContent = rung.model + " · " + rung.layers + " layers · resolving …";
+  const settle = renderStrata($(".strata", result), rung.layers, true);
 
+  let resp;
+  try {
+    resp = await api("/api/approve", { ladder: currentLadder, rungIndex: rung.index });
+  } catch (err) {
+    btn.removeAttribute("aria-busy");
+    note.textContent = "denied: " + err.message; // Cedar/budget denials surface verbatim
+    foot.textContent = rung.model + " · not launched";
+    li.classList.add("denied");
+    return;
+  }
+
+  currentLadder = resp.ladder; // advance the carried state
+  setMeter(resp.spentUSD);
+
+  // Settle the illustration, then reveal the server's finding + recommendation.
   setTimeout(() => {
-    $(".go-note", li).textContent = "done \u00b7 session " + rung.session;
-    $(".lens-foot", result).textContent = rung.model + " \u00b7 reading the residual stream";
-    $(".finding", result).textContent = rung.finding;
+    btn.removeAttribute("aria-busy");
+    note.textContent = "done · session " + resp.sessionId;
+    foot.textContent = rung.model + " · reading the residual stream";
+    $(".finding", result).textContent = resp.result.finding;
+
     const a = $(".assess", result);
-    a.innerHTML = `<span class="verb ${rung.assess.decision}">${rung.assess.decision}</span>` +
-                  `<span class="reason">${rung.assess.reason}</span>`;
-    $(".export", result).hidden = false;
+    const dec = resp.recommendation.decision;
+    a.innerHTML = `<span class="verb ${esc(dec)}">${esc(dec)}</span>` +
+      `<span class="reason">${esc(resp.recommendation.reason)}</span>`;
+
+    // Opt-in export of the user's own saves (presigned; never auto-egress).
+    const ex = $(".export", result);
+    ex.hidden = false;
+    $(".export-note", ex).innerHTML =
+      `Stays in your region by default. Export is a presigned pull from your own ` +
+      `bucket — <code>foray export ${esc(resp.sessionId)}</code>`;
+    ex.querySelectorAll(".dl").forEach(b =>
+      b.addEventListener("click", () => doExport(resp.sessionId, b.dataset.kind, ex)));
+
     li.classList.add("done");
 
-    if (rung.assess.decision === "climb" && RUNGS[rung.n + 1]) {
-      cursor = rung.n + 1;
-      $("#rungs").appendChild(rungCard(RUNGS[cursor]));
-      $("#rung-" + cursor).scrollIntoView({ behavior: REDUCED ? "auto" : "smooth", block: "center" });
+    // Climb only on a fresh Go: append the next rung the brain proposed (if any).
+    if (dec === "climb" && resp.nextProposal) {
+      const next = rungCard(resp.nextProposal);
+      $("#rungs").appendChild(next);
+      next.scrollIntoView({ behavior: REDUCED ? "auto" : "smooth", block: "center" });
     } else {
-      showReceipt();
+      showReceipt(resp);
     }
   }, settle);
 }
 
-function downloadStub(rung, kind, li) {
-  let note = li.querySelector(".export .export-note");
-  const url = `https://your-bucket.s3.amazonaws.com/sessions/${rung.session}/${kind}.zip?X-Amz-Signature=\u2026(presigned)`;
-  note.innerHTML = `presigned, expires in 15 min \u2014 <code style="color:var(--cyan)">${url}</code>`;
+async function doExport(sessionId, kind, ex) {
+  const note = $(".export-note", ex);
+  try {
+    const link = await api("/api/export", { sessionId, kind });
+    note.innerHTML = `presigned (${esc(link.kind)}), expires ${esc(link.expiresAt)} — ` +
+      `<code class="url">${esc(link.url)}</code>`;
+  } catch (err) {
+    note.textContent = "export: " + err.message; // residency/ownership denials, verbatim
+  }
 }
 
-function showReceipt() {
+function showReceipt(resp) {
   const r = $("#receipt");
   r.hidden = false;
-  r.innerHTML = `receipt \u00b7 <b>${cursor + 1}</b> rung(s) run \u00b7 ` +
-    `<b>$${spent.toFixed(2)}</b> of $5.00 spent on this question \u00b7 ` +
-    `instances self-terminated on idle.`;
+  const rungs = (currentLadder && currentLadder.Cursor) || 0;
+  r.textContent = `receipt · ${rungs} rung(s) run · ` +
+    `$${Number(resp.spentUSD).toFixed(2)} of $${Number(resp.budgetUSD).toFixed(2)} ` +
+    `spent on this question · instances self-terminate on idle.`;
   r.scrollIntoView({ behavior: REDUCED ? "auto" : "smooth", block: "center" });
+}
+
+/* ---- propose: the brain's first move (a ladder, or a clarifying question) ---- */
+async function propose(question) {
+  const propose = $("#propose");
+  propose.disabled = true;
+  propose.setAttribute("aria-busy", "true");
+  propose.textContent = "Proposing …";
+
+  const s = $("#session");
+  const rungs = $("#rungs");
+  const receipt = $("#receipt");
+  rungs.innerHTML = "";
+  receipt.hidden = true;
+  currentLadder = null;
+
+  let resp;
+  try {
+    resp = await api("/api/propose", { question });
+  } catch (err) {
+    s.hidden = false;
+    $("#qline").textContent = "couldn't reach the brain: " + err.message;
+    resetPropose();
+    return;
+  }
+
+  s.hidden = false;
+
+  // A clarifying question short-circuits: naming a model is the wrong first move.
+  if (resp.clarify) {
+    $("#qline").innerHTML = "<em>foray needs to know first:</em> " + esc(resp.clarify);
+    resetPropose();
+    return;
+  }
+
+  currentLadder = resp.ladder;
+  setMeter(0);
+  $("#qline").innerHTML = "“" + esc(question) +
+    "” <em>— cheapest experiment first; climb only if it's worth it.</em>";
+  rungs.appendChild(rungCard(resp.proposal));
+  s.scrollIntoView({ behavior: REDUCED ? "auto" : "smooth", block: "start" });
+  resetPropose();
+}
+
+function resetPropose() {
+  const propose = $("#propose");
+  propose.disabled = false;
+  propose.removeAttribute("aria-busy");
+  propose.textContent = "Propose an experiment";
 }
 
 /* ---- wire up ---- */
 $("#ask").addEventListener("submit", (e) => {
   e.preventDefault();
-  const q = $("#q").value.trim() || "why does the model store France as Paris?";
-  $("#propose").disabled = true; $("#propose").textContent = "Proposed \u2193";
-  const s = $("#session");
-  s.hidden = false;
-  $("#qline").innerHTML = "\u201c" + q + "\u201d <em>\u2014 cheapest experiment first; climb only if it's worth it.</em>";
-  cursor = 0;
-  $("#rungs").innerHTML = "";
-  $("#rungs").appendChild(rungCard(RUNGS[0]));
-  s.scrollIntoView({ behavior: REDUCED ? "auto" : "smooth", block: "start" });
+  const q = $("#q").value.trim();
+  if (!q) { $("#q").focus(); return; }
+  propose(q);
 });
 
 heroPreview();

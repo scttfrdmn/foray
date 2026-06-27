@@ -123,6 +123,33 @@ prefix.
 - `internal/device`: `ByInstanceType` resolves an EC2 instance type to its
   enabled tier option (the `--hardware` override and the `sessions` view); a
   GA-gated backend never matches.
+- `internal/webapi`: the brain-over-HTTP surface (ARCHITECTURE.md §6.8) — the
+  same result-gated loop the CLI walks in-process, exposed as a small JSON API so
+  the static page becomes a thin client. `Handler(deps)` is a stdlib `ServeMux`:
+  `POST /api/propose` (question → a clarifying question or the planned ladder +
+  first rung), `POST /api/approve` (one loop iteration — Cedar-gated launch →
+  trace through the gateway → interpret → assess → the next rung, if any, awaiting
+  a fresh Go), `POST /api/export` (the opt-in presigned download), and
+  `GET /healthz`. It holds no daemon state — the client carries the `Ladder` JSON
+  on each call and Cedar still gates server-side at `Approve` — so it drops onto a
+  cold Lambda unchanged at the deploy step and the control plane rests at ~$0.
+  Responses carry references only (`s3://` save ref + viz ref), never tensors — a
+  test guards against tensor egress. `NewFakeDeps` runs the whole loop with zero
+  AWS for `FORAY_FAKE=1`. Closes #27, #52.
+- `cmd/foray-web`: thin dev server that serves the static `web/` SPA alongside
+  `webapi.Handler` so local rehearsal is one command (`make web-fake`); per-
+  invocation, no daemon state. Real path is refused here (the production surface
+  is the deploy step's Lambda), mirroring `cmd/forayd`.
+- `web/`: the page is now a thin client over the real loop — it `fetch`es
+  `/api/propose` and `/api/approve` instead of replaying a canned `RUNGS` array,
+  binds the live cost meter and per-rung cost to the brain's own estimates (#52),
+  renders the brain's findings and climb/stop recommendations, climbs only on a
+  fresh Go, and offers the opt-in export. The strata panel is now an explicitly
+  illustrative logit lens (seeded from the rung's real layer count; the rendered
+  viz arrives via `vizRef` at deploy). Accessibility pass (#51): a skip link,
+  `role="img"`/`aria-label` on the lens, `aria-busy` Go buttons, an `aria-live`
+  finding/meter, visible focus rings, and `prefers-reduced-motion` honored
+  throughout. Closes #51.
 
 ### Changed
 

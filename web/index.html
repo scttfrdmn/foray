@@ -16,10 +16,12 @@
 -->
 <!--
   foray — the page. Static SPA (S3 + CloudFront). Vanilla HTML/CSS/JS, no build,
-  in the aws-agentcore-demo lineage. Walks the real foray loop client-side with
-  the same canned data as `make demo-fake`: question -> proposed rung -> Go ->
-  logit-lens result -> assess -> climb -> receipt, with opt-in download.
-  The polished build of ARCHITECTURE.md §6.8.
+  in the aws-agentcore-demo lineage. A thin client over the brain loop
+  (internal/webapi): question -> POST /api/propose -> proposed rung -> Go ->
+  POST /api/approve (Cedar-gated launch, trace, interpret, assess) -> finding ->
+  climb on a fresh Go -> receipt, with opt-in export. Under `make web-fake` the
+  server runs the offline fake loop, so the page rehearses with no AWS.
+  Skeleton + style contract of ARCHITECTURE.md §6.8; the polished build is deferred.
 -->
 <html lang="en">
 <head>
@@ -32,6 +34,7 @@
   <link rel="stylesheet" href="styles.css">
 </head>
 <body>
+  <a class="sr-only skip" href="#ask">Skip to the question box</a>
   <header class="bar">
     <div class="wordmark">foray<span class="dot">.</span></div>
     <div class="bar-mid">ephemeral deep inference</div>
@@ -41,7 +44,7 @@
     </div>
   </header>
 
-  <main>
+  <main id="main">
     <section class="hero">
       <div class="hero-copy">
         <p class="eyebrow">ADI — AWS Deep Inference</p>
@@ -65,12 +68,13 @@
         </ul>
       </div>
 
-      <figure class="lens lens--hero" id="hero-lens" aria-label="Logit lens preview">
+      <figure class="lens lens--hero" id="hero-lens" role="img"
+              aria-label="Illustrative logit lens: per-layer confidence climbing as a model resolves an answer. The real rendered viz comes from your own GPU.">
         <figcaption>
-          <span class="lens-tag">live preview · logit lens</span>
+          <span class="lens-tag">illustration · logit lens</span>
           <span class="lens-prompt" id="hero-prompt"></span>
         </figcaption>
-        <div class="strata" id="hero-strata"></div>
+        <div class="strata" id="hero-strata" aria-hidden="true"></div>
         <div class="lens-foot"><span id="hero-foot"></span></div>
       </figure>
     </section>
@@ -98,7 +102,7 @@
     <span>foray · ADI</span>
     <span class="foot-sep">/</span>
     <span>weights and saved activations never leave your region unless you export them</span>
-    <span class="badge" id="fake-badge">rehearsal · canned data, no AWS</span>
+    <span class="badge" id="fake-badge">rehearsal · fake brain, no AWS</span>
   </footer>
 
   <script src="app.js"></script>
