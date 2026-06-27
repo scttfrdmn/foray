@@ -170,7 +170,8 @@ func TestEnvelopeAndCeilingAreDistinct(t *testing.T) {
 			t.Fatalf("Cedar should permit rung 1 under a $5 ceiling, denied: %s", reason)
 		}
 		// ...but the brain's envelope stops the climb ($0.10 spent + $1.00 > $0.50).
-		rec, err := b.Assess(ctx, l, &Result{Rung: 0, Finding: "effect present"})
+		// EffectPresent so the Stop is the envelope's doing, not an honest negative.
+		rec, err := b.Assess(ctx, l, &Result{Rung: 0, Finding: "effect present", EffectPresent: true})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -192,7 +193,7 @@ func TestEnvelopeAndCeilingAreDistinct(t *testing.T) {
 			t.Fatalf("rung 0 within ceiling should be permitted: %v", err)
 		}
 		// The envelope alone would happily climb ($0.10 + $1.00 <= $5)...
-		rec, _ := b.Assess(ctx, l, &Result{Rung: 0, Finding: "effect present"})
+		rec, _ := b.Assess(ctx, l, &Result{Rung: 0, Finding: "effect present", EffectPresent: true})
 		if rec.Decision != Climb {
 			t.Fatalf("envelope has room; Assess should recommend Climb, got %s", rec.Decision)
 		}

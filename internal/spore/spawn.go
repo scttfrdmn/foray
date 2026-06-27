@@ -18,6 +18,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -30,6 +31,9 @@ type Spawn interface {
 	Launch(ctx context.Context, spec LaunchSpec) (Instance, error)
 	// Status reports an instance's current state and idle/TTL deadlines.
 	Status(ctx context.Context, instanceID string) (Instance, error)
+	// List enumerates the instances spawn manages — what `foray sessions` shows
+	// (age, TTL, $-so-far). The adapter scopes it to foray-launched instances.
+	List(ctx context.Context) ([]Instance, error)
 	// Terminate destroys the instance (permanent). End of session → $0.
 	Terminate(ctx context.Context, instanceID string) error
 	// KeepWarm rolls an instance's idle deadline forward to reflect recent
@@ -60,6 +64,7 @@ type Instance struct {
 	Region       string    `json:"region"`
 	State        string    `json:"state"` // pending | running | stopping | terminated | hibernated
 	PublicDNS    string    `json:"public_dns"`
+	LaunchedAt   time.Time `json:"launch_time"`   // when the instance started; backs session age + $-so-far. TODO(verify-json)
 	TTLDeadline  time.Time `json:"ttl_deadline"`  // hard terminate time
 	IdleDeadline time.Time `json:"idle_deadline"` // next idle reap time (rolled forward by KeepWarm)
 }
@@ -112,6 +117,31 @@ func (s spawnAdapter) Status(ctx context.Context, instanceID string) (Instance, 
 		return Instance{}, fmt.Errorf("spawn status %s: parse json: %w", instanceID, err)
 	}
 	return inst, nil
+}
+
+// forayNamePrefix scopes List to instances this control plane launched (spawn
+// names are session-scoped, set by brain.sessionName as "foray-rung...").
+const forayNamePrefix = "foray-"
+
+func (s spawnAdapter) List(ctx context.Context) ([]Instance, error) {
+	out, err := s.run.Run(ctx, "spawn", "list", "-o", "json")
+	if err != nil {
+		return nil, fmt.Errorf("spawn list: %w", err)
+	}
+	var all []Instance
+	if err := json.Unmarshal(out, &all); err != nil {
+		return nil, fmt.Errorf("spawn list: parse json: %w", err)
+	}
+	// Scope to foray sessions: spawn may manage instances from other tools sharing
+	// the account. A foray session is named "foray-rung<n>-<model>" (see
+	// brain.sessionName); filter on that prefix.
+	foray := all[:0]
+	for _, inst := range all {
+		if strings.HasPrefix(inst.Name, forayNamePrefix) {
+			foray = append(foray, inst)
+		}
+	}
+	return foray, nil
 }
 
 func (s spawnAdapter) Terminate(ctx context.Context, instanceID string) error {

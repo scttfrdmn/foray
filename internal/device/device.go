@@ -123,6 +123,25 @@ func Options(minHBM int) []Option {
 	return out
 }
 
+// ByInstanceType resolves an EC2 instance type to its enabled tier option — the
+// expert path's --hardware override and the `sessions` view both need to label a
+// concrete instance with its tier/GPU. Disabled providers (neuron) never match,
+// so an override cannot reach a GA-gated backend through this door either. ok is
+// false for an unknown or disabled instance type.
+func ByInstanceType(it string) (Option, bool) {
+	for _, p := range registry {
+		if !p.Enabled() {
+			continue
+		}
+		for _, o := range p.options() {
+			if o.InstanceType == it {
+				return o, true
+			}
+		}
+	}
+	return Option{}, false
+}
+
 // nvidia is the only enabled provider. Tier capacities come from ARCHITECTURE.md
 // §6.3; TierLarge advertises a multi-GPU aggregate so 405B-class footprints map
 // to it alone.

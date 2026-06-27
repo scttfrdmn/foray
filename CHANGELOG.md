@@ -93,8 +93,45 @@ prefix.
   environment), and plans → asks for an explicit Go → Cedar-gates → launches the
   rung via spawn (result-driven climbing over forayd lands with the gateway-wired
   CLI in step 7). `FORAY_FAKE=1` still walks the whole loop unattended.
+- `cmd/foray`: the full CLI on-ramp (ARCHITECTURE.md §5) — one result-gated loop
+  shared by the fake and real paths that walks
+  propose → Go → `Approve` → trace → interpret → assess → climb. Results are
+  fetched through the gateway library hosted **in-process** (the CLI plays the
+  role forayd plays as a Lambda: `gateway.Route` + the idle bridge, no running
+  daemon and no DynamoDB needed), so the human climbs rung by rung — **each climb
+  a fresh Go, never auto-climbed**, and the loop **stops on an honest negative**.
+  The expert on-ramp (`--model/--technique/--engine/--hardware/--budget`) skips
+  the dialog and builds one priced rung via `brain.ExpertLadder` (Cedar still
+  gates it; `--budget` is the per-question envelope). New verbs: `models` (list /
+  resolve sources via `catalog.Parse`), `sessions` (age, TTL, `$-so-far` via
+  `spore.Spawn.List` + truffle), `stop <session>` (confirm → `spawn.Terminate`),
+  and a real `export` path that runs the Cedar export gate (`CedarExportPolicy`,
+  ownership via `spawn.Status`) ahead of a clearly-labeled presigner stub (the
+  real S3 presigner is deferred to the deploy step, #25). `make demo-fake` walks
+  the whole loop — including the gateway trace and the climb — offline. Closes
+  #20, #21, #22, #23, #24.
+- `internal/brain`: an `Interpreter` seam (`AgentCoreInterpreter` real,
+  `fakeInterpreter` offline) so the brain frames a rung's result against the
+  question and reports the honest-negative signal — the LLM interprets, never
+  touches the money path or acceptance. `RawResult` is the brain-local view of a
+  trace (refs only, never tensors). `ExpertLadder`/`ExpertSpec` build a one-rung
+  ladder from explicit knobs with no Bedrock.
+- `internal/spore`: `Spawn.List` enumerates foray-launched instances (backs
+  `foray sessions`); `Instance` gains `LaunchedAt` for session age + `$-so-far`.
+- `internal/gateway`: `NewFakeWorker` exposes the canned worker so a caller can
+  build a `Gateway` over its own store + spawn.
+- `internal/device`: `ByInstanceType` resolves an EC2 instance type to its
+  enabled tier option (the `--hardware` override and the `sessions` view); a
+  GA-gated backend never matches.
 
 ### Changed
+
+- `internal/brain`: `Result` gains `EffectPresent`; `Assess` now stops the climb
+  on an honest negative (`!EffectPresent`) before the budget gate — a null result
+  stops regardless of remaining envelope ("don't pay to confirm nothing"). `Brain`
+  gains the `Interp` seam and an `Interpret` method; the fake's executor is now the
+  real `SpawnExecutor` over a fake spawn (the offline loop exercises real executor
+  and gateway code).
 
 - `internal/brain`: `Rung` gains `ModelSource` and `Gradients` so the Cedar
   Experiment entity is faithful (additive; the fake sets them).
