@@ -1,0 +1,106 @@
+<!doctype html>
+<!--
+  Copyright 2026 Scott Friedman
+
+  Licensed under the Apache License, Version 2.0 (the "License");
+  you may not use this file except in compliance with the License.
+  You may obtain a copy of the License at
+
+      http://www.apache.org/licenses/LICENSE-2.0
+
+  Unless required by applicable law or agreed to in writing, software
+  distributed under the License is distributed on an "AS IS" BASIS,
+  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+  See the License for the specific language governing permissions and
+  limitations under the License.
+-->
+<!--
+  foray — the page. Static SPA (S3 + CloudFront). Vanilla HTML/CSS/JS, no build,
+  in the aws-agentcore-demo lineage. Walks the real foray loop client-side with
+  the same canned data as `make demo-fake`: question -> proposed rung -> Go ->
+  logit-lens result -> assess -> climb -> receipt, with opt-in download.
+  The polished build of ARCHITECTURE.md §6.8.
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>foray — deep inference, ephemeral</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="bar">
+    <div class="wordmark">foray<span class="dot">.</span></div>
+    <div class="bar-mid">ephemeral deep inference</div>
+    <div class="meter" id="meter" aria-live="polite">
+      <span class="meter-label">this question</span>
+      <span class="meter-val" id="meter-val">$0.00</span>
+    </div>
+  </header>
+
+  <main>
+    <section class="hero">
+      <div class="hero-copy">
+        <p class="eyebrow">ADI — AWS Deep Inference</p>
+        <h1>Ask a model<br><em>why</em>.</h1>
+        <p class="lede">
+          Remote access to the internals of any open model, on the right GPU, for
+          the length of one experiment — then it's gone. Nothing kept warm.
+          All you need is an AWS account.
+        </p>
+
+        <form class="ask" id="ask" autocomplete="off">
+          <label for="q" class="sr-only">Your question</label>
+          <input id="q" name="q" type="text"
+                 value="why does the model store France as Paris?" />
+          <button type="submit" id="propose">Propose an experiment</button>
+        </form>
+        <ul class="chips">
+          <li>cheapest model first</li>
+          <li>weights stream in seconds</li>
+          <li>you pay per session, not per hour</li>
+        </ul>
+      </div>
+
+      <figure class="lens lens--hero" id="hero-lens" aria-label="Logit lens preview">
+        <figcaption>
+          <span class="lens-tag">live preview · logit lens</span>
+          <span class="lens-prompt" id="hero-prompt"></span>
+        </figcaption>
+        <div class="strata" id="hero-strata"></div>
+        <div class="lens-foot"><span id="hero-foot"></span></div>
+      </figure>
+    </section>
+
+    <!-- The loop, revealed on "Propose". Rungs render here. -->
+    <section class="session" id="session" hidden>
+      <div class="session-head">
+        <h2>Your question</h2>
+        <p class="qline" id="qline"></p>
+      </div>
+      <ol class="rungs" id="rungs"></ol>
+      <div class="receipt" id="receipt" hidden></div>
+    </section>
+
+    <section class="expert">
+      <h2>Or skip the conversation</h2>
+      <p>Every knob, any model, a CLI. Experts don't need to be asked.</p>
+      <pre class="code"><span class="c">$</span> foray run <span class="s">"why does the model refuse this prompt?"</span>
+<span class="c">$</span> foray run --model meta-llama/Llama-3.1-8B --technique logit-lens --engine eager
+<span class="c">$</span> foray export <span class="s">&lt;session&gt;</span>           <span class="cm"># your saves, your call</span></pre>
+    </section>
+  </main>
+
+  <footer class="foot">
+    <span>foray · ADI</span>
+    <span class="foot-sep">/</span>
+    <span>weights and saved activations never leave your region unless you export them</span>
+    <span class="badge" id="fake-badge">rehearsal · canned data, no AWS</span>
+  </footer>
+
+  <script src="app.js"></script>
+</body>
+</html>

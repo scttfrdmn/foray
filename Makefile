@@ -1,0 +1,82 @@
+# foray — Makefile. See CLAUDE.md "Make targets" for the contract.
+# Copyright 2026 Scott Friedman. Apache License 2.0.
+
+SHELL       := bash
+GO          ?= go
+BIN         := bin
+VERSION     := $(shell cat VERSION 2>/dev/null || echo 0.0.0)
+GIT_COMMIT  := $(shell git rev-parse --short HEAD 2>/dev/null || echo none)
+LDFLAGS     := -X main.version=$(VERSION) -X main.commit=$(GIT_COMMIT)
+
+# AWS profile for any AWS-touching target (see CLAUDE.md / project memory).
+AWS_PROFILE ?= aws
+export AWS_PROFILE
+
+.DEFAULT_GOAL := help
+
+## help: list targets
+.PHONY: help
+help:
+	@grep -E '^## ' $(MAKEFILE_LIST) | sed 's/## //' | awk -F: '{printf "  \033[1m%-14s\033[0m%s\n", $$1, $$2}'
+
+## build: build foray + forayd
+.PHONY: build
+build:
+	@mkdir -p $(BIN)
+	$(GO) build -ldflags "$(LDFLAGS)" -o $(BIN)/foray ./cmd/foray
+	@if [ -d ./cmd/forayd ]; then $(GO) build -ldflags "$(LDFLAGS)" -o $(BIN)/forayd ./cmd/forayd; \
+	 else echo "note: cmd/forayd not implemented yet (build step 4)"; fi
+
+## lint: gofmt + go vet + staticcheck
+.PHONY: lint
+lint: fmt-check
+	$(GO) vet ./... || true
+	@if command -v staticcheck >/dev/null 2>&1; then staticcheck ./... || true; \
+	 elif command -v golangci-lint >/dev/null 2>&1; then golangci-lint run || true; \
+	 else echo "note: install staticcheck or golangci-lint for full lint"; fi
+
+## fmt: format the tree
+.PHONY: fmt
+fmt:
+	gofmt -w .
+
+## fmt-check: fail if any Go file is not gofmt-clean
+.PHONY: fmt-check
+fmt-check:
+	@out=$$(gofmt -l .); if [ -n "$$out" ]; then echo "gofmt needed:"; echo "$$out"; exit 1; fi
+
+## test: go test ./... (no AWS)
+.PHONY: test
+test:
+	$(GO) test ./...
+
+## demo-fake: full intent->plan->Go->fake-spawn->receipt, no AWS (CI gate)
+.PHONY: demo-fake
+demo-fake:
+	@echo "==> demo-fake: walking the loop with FORAY_FAKE=1 (no AWS)"
+	FORAY_FAKE=1 $(GO) run ./cmd/foray run "why does the model store France as Paris?" --yes
+
+## license-check: verify every source file carries an Apache header
+.PHONY: license-check
+license-check:
+	@bash scripts/license-check.sh
+
+## worker: build the nnsight worker image
+.PHONY: worker
+worker:
+	@echo "note: worker image not implemented yet (build step 5). See issues."
+
+## deploy: IaC up (S3+CloudFront, API GW+Lambda, IAM, Cedar, DDB)
+.PHONY: deploy
+deploy:
+	@echo "note: deploy (IaC) not implemented yet (build step 9). See issues."
+
+## teardown: IaC down — leave nothing running, nothing billing
+.PHONY: teardown
+teardown:
+	@echo "note: teardown not implemented yet (build step 9). See issues."
+
+## clean: remove build artifacts
+.PHONY: clean
+clean:
+	rm -rf $(BIN) dist coverage.out coverage.html

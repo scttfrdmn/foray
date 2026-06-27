@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  format:
+    name: gofmt + license headers
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+      - name: gofmt
+        run: |
+          out=$(gofmt -l .)
+          if [ -n "$out" ]; then echo "gofmt needed:"; echo "$out"; exit 1; fi
+      - name: license headers
+        run: bash scripts/license-check.sh
+
+  vet-build:
+    name: vet + build (implemented packages)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+      # The full tree does not build until steps 1 + 6 land (device/sizing).
+      # Gate on the packages that compile today; the rest is tracked in issues.
+      - name: vet implemented packages
+        run: go vet ./internal/export/...
+
+  lint:
+    name: golangci-lint
+    runs-on: ubuntu-latest
+    continue-on-error: true # informational until the core packages land
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+      - uses: golangci/golangci-lint-action@v6
+        with:
+          version: latest
+
+  test:
+    name: go test (full tree — tracking, allowed to fail)
+    runs-on: ubuntu-latest
+    continue-on-error: true # see CHANGELOG "Notes": specs precede implementation
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+      - run: go test ./...
+
+  demo-fake:
+    name: demo-fake (CI gate — tracking until brain+sizing land)
+    runs-on: ubuntu-latest
+    continue-on-error: true # becomes the hard gate once steps 1 + 6 close
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+      - run: make demo-fake

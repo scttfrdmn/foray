@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Architecture
+    url: https://github.com/scttfrdmn/foray/blob/main/ARCHITECTURE.md
+    about: Read the full design before filing a large feature.
+  - name: Security report
+    url: https://github.com/scttfrdmn/foray/security/advisories/new
+    about: Report vulnerabilities privately, not as a public issue.

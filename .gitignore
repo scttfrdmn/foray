@@ -1,0 +1,35 @@
+# Binaries
+/bin/
+/dist/
+foray
+forayd
+*.exe
+*.test
+*.out
+
+# Go
+*.prof
+coverage.out
+coverage.html
+vendor/
+
+# Build / IaC artifacts
+*.tfstate
+*.tfstate.*
+.terraform/
+*.tfvars
+!example.tfvars
+
+# Worker image build context
+worker/_build/
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
+
+# Local env
+.env
+.env.local

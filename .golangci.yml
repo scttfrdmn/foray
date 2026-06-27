@@ -1,0 +1,30 @@
+# golangci-lint config for foray. stdlib-first, terse, no surprises.
+run:
+  timeout: 5m
+  tests: true
+
+linters:
+  enable:
+    - gofmt
+    - govet
+    - staticcheck
+    - errcheck
+    - ineffassign
+    - unused
+    - misspell
+    - revive
+
+linters-settings:
+  gofmt:
+    simplify: true
+  misspell:
+    locale: US
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
+  exclude-rules:
+    # Fakes and test fixtures intentionally ignore some returns.
+    - path: (_test\.go|/fake\.go)
+      linters:
+        - errcheck

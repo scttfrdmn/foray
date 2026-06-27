@@ -1,0 +1,31 @@
+name: Feature / implementation task
+description: A unit of work toward a build-order step
+title: "[area]: "
+labels: ["type:feature"]
+body:
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What should exist when this is done?
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: Concrete, checkable outcomes (cite tests where they exist).
+      placeholder: |
+        - [ ] internal/sizing/footprint_test.go passes
+        - [ ] no AWS calls in unit tests
+    validations:
+      required: true
+  - type: input
+    id: build-step
+    attributes:
+      label: Build step (ARCHITECTURE.md §10)
+      placeholder: "1 — device + sizing"
+  - type: textarea
+    id: notes
+    attributes:
+      label: Notes / invariants in play

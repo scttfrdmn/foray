@@ -1,0 +1,28 @@
+name: Invariant CI gate
+description: Turn a CLAUDE.md invariant into an enforced, automated check
+title: "[invariant]: "
+labels: ["type:ci", "invariant"]
+body:
+  - type: dropdown
+    id: invariant
+    attributes:
+      label: Which invariant
+      options:
+        - Ephemeral by default
+        - Control plane rests at ~$0
+        - Cost is per-session, not per-hour
+        - No automatic egress of activations
+        - Single-tenant self-install (no sandbox)
+        - Device-agnostic worker (neuron gated)
+        - The question is load-bearing
+        - Brain proposes/interprets, never accepts
+        - No unresolved PLACEHOLDER / LICENSED_WORKLOAD_STUB at deploy
+    validations:
+      required: true
+  - type: textarea
+    id: check
+    attributes:
+      label: How the gate enforces it
+      description: The automated check (test, lint rule, CI step) that fails when violated.
+    validations:
+      required: true
