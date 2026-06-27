@@ -31,6 +31,15 @@ prefix.
   (`Approve`) is the only place a rung runs.
 - **`make demo-fake` now walks the full loop end-to-end offline** (intent → plan
   → Go → run → assess → climb → receipt), zero AWS — the MVP definition of done.
+- `internal/spore`: thin adapters over the spore.host binaries — `Truffle`
+  (`Price`/`Quota`/`Discover`), `Spawn` (`Launch`/`Status`/`Terminate`/
+  `KeepWarm`), and `Lagotto` (`Watch`/`List`/`Status`). Adapters shell out to the
+  installed CLIs via a `Runner` seam and parse their `-o json` output; a `Fake`
+  trio (`NewFake`/`FromEnv`) returns canned data with zero AWS for `FORAY_FAKE=1`.
+  `Spawn.KeepWarm(id, lastRequest)` is the idle-bridge surface the forayd gateway
+  (step 4) will drive so a model-holding worker isn't reaped between traces.
+  Resolves how foray depends on spore.host (issue #41): shell out, no Go-module
+  dependency — documented in the package doc.
 
 ### Changed
 
