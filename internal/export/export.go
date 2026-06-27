@@ -92,8 +92,8 @@ type Denied struct{ Reason string }
 
 func (e *Denied) Error() string { return "export denied: " + e.Reason }
 
-// TODO(claude-code):
-//   - S3Presigner: zip-on-demand for KindBundle (saves + outputs + nnsight +
-//     manifest.json), s3 presign GET for single objects; user's own bucket.
-//   - CedarExportPolicy: evaluate the `export` action against session + user.
-//   - FakePresigner / FakePolicy for FORAY_FAKE=1 (return a stub link).
+// The real Presigner (S3Presigner) lives in s3.go: a single-object presigned GET
+// for KindActivations/KindOutputs, and zip-on-demand for KindBundle (saves +
+// outputs + nnsight + manifest.json), all against the user's own bucket. The
+// Cedar export policy (CedarExportPolicy) lives in internal/brain/cedar.go; the
+// FORAY_FAKE=1 stubs live in fake.go.

@@ -85,3 +85,19 @@ jobs:
       - run: pip install -r worker/requirements.txt
       - run: ruff check worker
       - run: make worker-test
+
+  iac:
+    name: terraform fmt + validate + deploy-check (no AWS)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.7.5"
+      # No credentials, no apply: format, init without a backend, validate, and
+      # run the PLACEHOLDER/LICENSED_WORKLOAD_STUB guard. Real deploy is
+      # hand-validated, never in CI (the worker-smoke precedent).
+      - run: terraform -chdir=deploy/terraform fmt -check -recursive
+      - run: terraform -chdir=deploy/terraform init -backend=false
+      - run: terraform -chdir=deploy/terraform validate
+      - run: make deploy-check

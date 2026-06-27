@@ -150,6 +150,37 @@ prefix.
   `role="img"`/`aria-label` on the lens, `aria-busy` Go buttons, an `aria-live`
   finding/meter, visible focus rings, and `prefers-reduced-motion` honored
   throughout. Closes #51.
+- **deploy (step 9) — IaC for the ~$0 control plane.** `deploy/terraform/`
+  stands up S3 (a private OAC-only SPA bucket + an in-region saves/exports
+  bucket), CloudFront (SPA + `/api/*` and `/sessions/*` behaviors → API Gateway,
+  one origin), an API Gateway HTTP API, two cold Lambdas wrapping
+  `gateway.Handler` and `webapi.Handler` **verbatim** via the AWS Lambda Web
+  Adapter (no `aws-lambda-go` dependency; binary is `bootstrap` on
+  `provided.al2023`/`arm64`), an on-demand DynamoDB sessions table with TTL, and
+  three least-privilege IAM roles (the two Lambda execs + the `spawn` instance
+  role, #54). Cedar deploys nothing — it stays embedded and in-process.
+  `make deploy`/`make teardown` build, apply, sync, and verify; new
+  `make deploy-check` (#30) and `make teardown-verify` (#48) guard the
+  invariants. Closes #29, #30, #48, #54.
+- `internal/gateway`: `DynamoStore` — the prod `Store` (DynamoDB, AWS SDK v2).
+  `Touch` is a single `UpdateItem` on `last_request` (the idle-bridge hot path);
+  `Get` maps a missing item to `ErrUnknownSession`; the composite key reserves
+  `RECEIPT#<rung>` rows for per-question cost receipts. It deliberately does not
+  implement `enumerator`, so `/healthz` degrades to liveness (no Scan). The
+  deployed gateway's idle bridge is `spore.DynamoIdleBridge`: a KeepWarm-no-op
+  shim, since `Touch` already writes the durable `last_request` to DynamoDB that
+  a spawn-side consumer reads — no `spawn` exec in a Lambda runtime.
+- `internal/export`: `S3Presigner` — the real opt-in download (#25, #53). A
+  single-object, short-TTL presigned GET against the user's own bucket; for
+  `KindBundle`, a zip-on-demand of the session's saves + outputs + `nnsight` +
+  a synthesized `manifest.json` to one `exports/` object, then presigned —
+  oversized objects are dropped, logged, and recorded in the manifest (never
+  silently truncated). The CLI and web real paths now use it instead of the
+  stub presigner.
+- `cmd/forayd` and `cmd/foray-web`: real paths wired (previously refused). forayd
+  builds the `DynamoStore`-backed gateway over the HTTP worker; foray-web's
+  `webapi.NewRealDeps` wires the real Bedrock+Cedar+spawn brain, the DynamoDB
+  gateway, and the S3 export presigner from the environment Terraform injects.
 
 ### Changed
 

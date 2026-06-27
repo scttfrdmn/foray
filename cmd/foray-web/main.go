@@ -30,6 +30,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"log/slog"
 	"net/http"
@@ -52,18 +53,21 @@ func main() {
 
 	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
 
-	if !spore.Enabled() {
-		// Match cmd/forayd's posture: the real surface is API Gateway + Lambda over
-		// a persistent session store (deploy step). Until then refuse rather than
-		// stand up a half-wired real server.
-		log.Error("foray-web: real path is the deploy step's Lambda — run with FORAY_FAKE=1 for local rehearsal",
-			"version", version, "commit", commit)
-		os.Exit(1)
+	var deps webapi.Deps
+	if spore.Enabled() {
+		deps = webapi.NewFakeDeps()
+		log.Info("foray-web starting (FORAY_FAKE — in-memory, no AWS)",
+			"version", version, "commit", commit, "addr", *addr, "web", *webDir)
+	} else {
+		var err error
+		deps, err = webapi.NewRealDeps(context.Background(), log)
+		if err != nil {
+			log.Error("foray-web: wire real deps", "err", err, "version", version, "commit", commit)
+			os.Exit(1)
+		}
+		log.Info("foray-web starting (real — Bedrock + Cedar + DynamoDB + S3 export)",
+			"version", version, "commit", commit, "addr", *addr, "web", *webDir)
 	}
-
-	deps := webapi.NewFakeDeps()
-	log.Info("foray-web starting (FORAY_FAKE — in-memory, no AWS)",
-		"version", version, "commit", commit, "addr", *addr, "web", *webDir)
 
 	api := webapi.Handler(deps, log)
 	mux := http.NewServeMux()

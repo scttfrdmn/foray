@@ -70,9 +70,8 @@ func (h HTTPWorker) Run(ctx context.Context, workerURL string, g Graph) (TraceRe
 	return res, nil
 }
 
-// TODO(claude-code): DynamoDBStore implementing Store — the prod session<->
-// instance mapping (AWS SDK for Go v2). Get/Put/Touch by session_id; Touch is a
-// cheap UpdateItem on last_request so the hot path is one write. It need not
-// implement the enumerator capability (a Scan per /healthz would be wasteful);
-// /healthz degrades to plain liveness when List is absent. Lands with the deploy
-// step (§10 step 9) alongside the rest of the IaC.
+// The prod session<->instance mapping (DynamoDBStore implementing Store) lives
+// in dynamo.go: Get/Put/Touch by session_id, Touch a single UpdateItem on
+// last_request so the hot path is one write. It deliberately omits the
+// enumerator capability (a Scan per /healthz would be wasteful), so /healthz
+// degrades to plain liveness when List is absent.

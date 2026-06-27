@@ -1,5 +1,6 @@
 # Binaries (anchored to repo root so they don't match cmd/foray/, cmd/forayd/)
 /bin/
+/build/
 /dist/
 /foray
 /forayd

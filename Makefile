@@ -97,17 +97,45 @@ worker-smoke:
 	@echo "==> worker-smoke: real GPU + AWS (gpt2 logit-lens -> S3). Not a CI target."
 	$(PYTHON) -m worker.smoke
 
-## deploy: IaC up (S3+CloudFront, API GW+Lambda, IAM, Cedar, DDB)
+TF_DIR    ?= deploy/terraform
+TF_VARS   ?= prod.tfvars
+BUILD     := build
+
+## deploy-check: fail on unresolved PLACEHOLDER_* / LICENSED_WORKLOAD_STUB (no AWS)
+.PHONY: deploy-check
+deploy-check:
+	@bash scripts/deploy-check.sh
+
+## lambdas: cross-compile forayd + foray-web for Lambda (provided.al2023/arm64)
+.PHONY: lambdas
+lambdas:
+	@mkdir -p $(BUILD)/forayd $(BUILD)/foray-web
+	GOOS=linux GOARCH=arm64 CGO_ENABLED=0 $(GO) build -ldflags "$(LDFLAGS)" -o $(BUILD)/forayd/bootstrap ./cmd/forayd
+	GOOS=linux GOARCH=arm64 CGO_ENABLED=0 $(GO) build -ldflags "$(LDFLAGS)" -o $(BUILD)/foray-web/bootstrap ./cmd/foray-web
+	cd $(BUILD)/forayd && zip -q -j ../forayd.zip bootstrap
+	cd $(BUILD)/foray-web && zip -q -j ../foray-web.zip bootstrap
+
+## deploy: IaC up (S3+CloudFront, API GW+Lambda, IAM, Cedar embedded, DDB)
 .PHONY: deploy
-deploy:
-	@echo "note: deploy (IaC) not implemented yet (build step 9). See issues."
+deploy: deploy-check lambdas
+	cd $(TF_DIR) && terraform init && terraform apply -var-file=$(TF_VARS)
+	aws s3 sync web/ "s3://$$(cd $(TF_DIR) && terraform output -raw web_bucket)/" --delete
+	@echo "==> deployed. page: $$(cd $(TF_DIR) && terraform output -raw cloudfront_domain)"
 
 ## teardown: IaC down — leave nothing running, nothing billing
 .PHONY: teardown
 teardown:
-	@echo "note: teardown not implemented yet (build step 9). See issues."
+	-aws s3 rm "s3://$$(cd $(TF_DIR) && terraform output -raw web_bucket)/" --recursive 2>/dev/null
+	-aws s3 rm "s3://$$(cd $(TF_DIR) && terraform output -raw data_bucket)/" --recursive 2>/dev/null
+	cd $(TF_DIR) && terraform destroy -var-file=$(TF_VARS)
+	@$(MAKE) teardown-verify
+
+## teardown-verify: assert no Project=foray resource is left billing (no apply)
+.PHONY: teardown-verify
+teardown-verify:
+	@bash scripts/teardown-verify.sh
 
 ## clean: remove build artifacts
 .PHONY: clean
 clean:
-	rm -rf $(BIN) dist coverage.out coverage.html
+	rm -rf $(BIN) $(BUILD) dist coverage.out coverage.html
