@@ -26,35 +26,34 @@ jobs:
         run: bash scripts/license-check.sh
 
   vet-build:
-    name: vet + build (implemented packages)
+    name: vet + build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
           go-version: "1.26"
-      # The full tree does not build until steps 1 + 6 land (device/sizing).
-      # Gate on the packages that compile today; the rest is tracked in issues.
-      - name: vet implemented packages
-        run: go vet ./internal/export/...
+      - name: vet
+        run: go vet ./...
+      - name: build
+        run: go build ./...
 
   lint:
     name: golangci-lint
     runs-on: ubuntu-latest
-    continue-on-error: true # informational until the core packages land
+    continue-on-error: true # informational: version is unpinned, may add rules
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
           go-version: "1.26"
-      - uses: golangci/golangci-lint-action@v6
+      - uses: golangci/golangci-lint-action@v7
         with:
-          version: latest
+          version: v2.12.2
 
   test:
-    name: go test (full tree — tracking, allowed to fail)
+    name: go test (full tree)
     runs-on: ubuntu-latest
-    continue-on-error: true # see CHANGELOG "Notes": specs precede implementation
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -63,9 +62,8 @@ jobs:
       - run: go test ./...
 
   demo-fake:
-    name: demo-fake (CI gate — tracking until brain+sizing land)
+    name: demo-fake (CI gate)
     runs-on: ubuntu-latest
-    continue-on-error: true # becomes the hard gate once steps 1 + 6 close
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5

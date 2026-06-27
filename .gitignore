@@ -1,8 +1,8 @@
-# Binaries
+# Binaries (anchored to repo root so they don't match cmd/foray/, cmd/forayd/)
 /bin/
 /dist/
-foray
-forayd
+/foray
+/forayd
 *.exe
 *.test
 *.out

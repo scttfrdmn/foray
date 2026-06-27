@@ -5,16 +5,14 @@ open model, on right-sized EC2 GPUs, for the length of one experiment, in your
 own AWS account. Then it's gone.
 
 > [!NOTE]
-> **Status: scaffolding (v0.x, pre-release).** This repository currently holds
-> the architecture, the policy spine, the static web demo, the fake-mode
-> plumbing, and the test specifications for the core packages. The
-> implementation of those packages is tracked as issues and milestones — see
-> [Project status](#project-status). `go build ./...` and `go test ./...` are
-> **not** green yet by design: the test files specify packages
-> (`device`, `sizing`) that are not implemented, and `brain`/`cmd/foray` depend
-> on them. The **static web page** (`web/index.html`) runs the full loop today
-> with canned data; the Go `make demo-fake` path turns green once steps 1 and 6
-> land (the brain's fake ladder is already written and waiting on `sizing`).
+> **Status: early (v0.x, pre-release).** The AWS-free core is implemented and
+> green: `device`, `sizing`, and the `brain` ladder all build and test, and
+> **`make demo-fake` walks the full intent→plan→Go→run→assess→climb→receipt
+> loop offline** (the MVP definition of done). The AWS-touching pieces —
+> `catalog`, the real (non-fake) brain path, `forayd`, the worker, and deploy —
+> are not built yet; their work is tracked as issues and milestones (see
+> [Project status](#project-status)). The static web page (`web/index.html`)
+> runs the same loop client-side with canned data.
 
 [![CI](https://github.com/scttfrdmn/foray/actions/workflows/ci.yml/badge.svg)](https://github.com/scttfrdmn/foray/actions/workflows/ci.yml)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
@@ -64,11 +62,11 @@ The number that matters is **$/session, not $/hour**.
 git clone https://github.com/scttfrdmn/foray
 cd foray
 
-# Today: the static page runs the whole loop client-side with canned data.
-open web/index.html        # or: python3 -m http.server -d web
+make demo-fake             # intent -> plan -> Go -> run -> assess -> climb -> receipt
+                           # entirely offline, zero AWS calls (the CI gate)
 
-# Once steps 1 + 6 land (device/sizing + brain), the Go offline loop:
-make demo-fake             # intent -> plan -> Go -> run -> receipt, zero AWS (CI gate)
+# The static page runs the same loop client-side with canned data:
+open web/index.html        # or: python3 -m http.server -d web
 ```
 
 ## Project status
@@ -78,14 +76,14 @@ milestone; earlier steps have no AWS dependency.
 
 | Step | Component | State |
 | --- | --- | --- |
-| 0 | Bootstrap (repo, license, CI, layout) | ✅ this commit |
-| 1 | `device` + `sizing` | 🔲 tests written, impl tracked |
+| 0 | Bootstrap (repo, license, CI, layout) | ✅ done |
+| 1 | `device` + `sizing` | ✅ implemented + tested |
 | 2 | `catalog` | 🔲 tracked |
 | 3 | `spore` adapters (truffle / spawn / lagotto) | 🔲 tracked |
 | 4 | `forayd` gateway (the load-bearing contract) | 🔲 tracked |
 | 5 | `worker` (nnsight, Python) | 🔲 tracked |
-| 6 | `brain` (AgentCore + Cedar + HITL ladder) | 🟡 fake path present |
-| 7 | `foray` CLI | 🟡 fake path present |
+| 6 | `brain` (AgentCore + Cedar + HITL ladder) | 🟡 ladder + fake path green; real AgentCore/Cedar tracked |
+| 7 | `foray` CLI | 🟡 fake loop works; real path + expert flags tracked |
 | 8 | `web` static SPA | 🟡 skeleton + style contract |
 | 9 | `deploy` (IaC) | 🔲 tracked |
 

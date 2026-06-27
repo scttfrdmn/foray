@@ -1,11 +1,11 @@
-# golangci-lint config for foray. stdlib-first, terse, no surprises.
+# golangci-lint config (schema v2) for foray. stdlib-first, terse, no surprises.
+version: "2"
+
 run:
   timeout: 5m
-  tests: true
 
 linters:
   enable:
-    - gofmt
     - govet
     - staticcheck
     - errcheck
@@ -13,18 +13,29 @@ linters:
     - unused
     - misspell
     - revive
+  settings:
+    misspell:
+      locale: US
+    revive:
+      rules:
+        # ctx is kept on every seam method for interface symmetry and prod use,
+        # even where the fake path doesn't read it yet.
+        - name: unused-parameter
+          disabled: true
+        # Const blocks carry inline comments; a block doc-comment is redundant.
+        - name: exported
+          arguments: [checkPrivateReceivers]
+          disabled: true
+  exclusions:
+    rules:
+      # Fakes and test fixtures intentionally ignore some returns.
+      - path: (_test\.go|/fake\.go)
+        linters:
+          - errcheck
 
-linters-settings:
-  gofmt:
-    simplify: true
-  misspell:
-    locale: US
-
-issues:
-  max-issues-per-linter: 0
-  max-same-issues: 0
-  exclude-rules:
-    # Fakes and test fixtures intentionally ignore some returns.
-    - path: (_test\.go|/fake\.go)
-      linters:
-        - errcheck
+formatters:
+  enable:
+    - gofmt
+  settings:
+    gofmt:
+      simplify: true
