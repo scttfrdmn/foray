@@ -20,6 +20,11 @@ prefix.
 - `internal/sizing`: `Size(model, intervention)` → footprint + ranked hardware
   options. Engine routing (gradients/per-layer saves → eager; large prompt sweep
   → vLLM), residual-stream and KV-pool memory math.
+- `internal/catalog`: model-source resolver — `Parse(raw)` classifies and
+  validates a HuggingFace id, an `s3://` URI, or an `upload:<id>` ref into a
+  `Source` descriptor; unsupported sources wrap `ErrUnsupportedSource` with a
+  verbatim reason. Allowed kinds (`hf`/`s3`/`upload`) mirror the `modelSource`
+  values in `internal/brain/policy/foray.cedar`. AWS-free, table-driven tests.
 - `internal/brain`: the result-gated ladder core — `Brain`, `Ladder`, `Rung`,
   `Question`, `Proposal`, `Result`, `Recommendation`, the Planner/Policy/Executor
   seams, and `Propose`/`Approve`/`Assess`/`NextProposal`. The human "Go"
