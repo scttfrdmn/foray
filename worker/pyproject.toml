@@ -1,0 +1,32 @@
+# Copyright 2026 Scott Friedman. Apache License 2.0.
+# Worker tooling config (ruff + pytest). The worker is the one Python boundary in
+# foray; the Go control plane is configured separately (.golangci.yml, Makefile).
+
+[project]
+name = "foray-worker"
+version = "0.0.0"
+description = "foray nnsight worker — the one Python boundary (ARCHITECTURE.md §6.7)"
+requires-python = ">=3.12"
+license = { text = "Apache-2.0" }
+
+[tool.pytest.ini_options]
+# Tests run from the worker/ dir; the package imports as `worker.*` from the repo
+# root, so rootdir is the parent. testpaths keeps discovery to this tree.
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+# PLC0415 (import-outside-top-level) is intentionally allowed: heavy deps
+# (torch/nnsight/vllm/boto3) are imported lazily inside real paths so the fake
+# path and CI need none of them. That is a design rule, not a smell.
+select = ["E", "F", "I", "PL"]
+ignore = ["PLC0415"]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests assert on literal HTTP status codes (200/400) — that's clearer than
+# hoisting them to named constants, so the magic-value rule is noise here.
+"tests/*" = ["PLR2004"]

@@ -53,12 +53,33 @@ prefix.
 - `cmd/forayd`: thin entrypoint wrapping `Gateway.Handler` in an `http.Server`
   for local/dev and rehearsal; per-invocation gateway logic (no daemon state) so
   it drops onto a cold Lambda and the control plane rests at ~$0.
+- `worker/`: the nnsight worker — the one Python boundary (ARCHITECTURE.md §6.7).
+  FastAPI server speaking the wire contract fixed by step 4: `POST /trace`
+  (`Graph{engine, payload}` → `TraceResult{session_id, save_ref, viz_ref,
+  nnsight}`, references only — never tensors) and `GET /healthz`. Engine routing
+  per §3 — `eager` (nnsight `LanguageModel`, full transparency + gradients, the
+  universal path) vs. `vllm` (paged-attention throughput, no gradients); a
+  gradient request on `vllm` is rejected with a clear `400` (#49). GDS loader
+  streams weights S3→HBM on boot with a plain-download fallback (#14). Device
+  target is a parameter (`FORAY_DEVICE`, default `cuda`); `neuron` is
+  registered-but-disabled and refused until TorchNeuron GAs, mirroring the Go
+  registry's three-layer gate (#15). Heavy deps (`torch`/`nnsight`/`vllm`/`boto3`)
+  are imported lazily inside the real paths, so `FORAY_FAKE=1` and the unit tests
+  run with no GPU, no AWS, and no torch. Closes #13.
+- `worker/Dockerfile` + `make worker`: a single image holding both engines; the
+  device target is injected by the control plane at run time, not baked in (#50).
+- `make worker-test` (pytest under `FORAY_FAKE=1`, the new CI job), `make
+  worker-fake` (local uvicorn), and `make worker-smoke` (manual real GPU/AWS
+  smoke, opt-in via `FORAY_GPU_SMOKE=1`, never run in CI — with a reproducible EC2
+  recipe in `worker/README.md`).
 
 ### Changed
 
 - CI: `go test ./...`, `go build ./...`/`go vet ./...`, and `make demo-fake` are
   now hard gates (dropped `continue-on-error`); `.golangci.yml` migrated to the
-  v2 schema.
+  v2 schema. New `worker-test` job runs the worker's pytest suite under
+  `FORAY_FAKE=1` (Python 3.12, base deps only — no GPU, no AWS) and `ruff check`.
+  `scripts/license-check.sh` now covers `*.py` and `Dockerfile`.
 
 ### Project bootstrap
 
@@ -82,9 +103,10 @@ prefix.
 
 ### Notes
 
-- The whole tree now builds and `go test ./...` passes. The AWS-touching pieces
-  (`catalog`, the real non-fake `brain` path, `gateway`/`forayd`, `worker`,
-  `spore` adapters, `deploy`) are not yet implemented; their work is tracked in
-  GitHub milestones and issues.
+- The whole tree now builds and `go test ./...` passes. The remaining AWS-touching
+  pieces (the real non-fake `brain` path, the DynamoDB `gateway.Store`, the GPU/AWS
+  `worker` real path, `deploy`) are not yet exercised in CI; their work is tracked
+  in GitHub milestones and issues. The worker's real GPU/AWS path is validated by
+  hand via `make worker-smoke` (see `worker/README.md`), never in CI.
 
 [Unreleased]: https://github.com/scttfrdmn/foray/commits/main

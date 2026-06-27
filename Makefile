@@ -12,6 +12,12 @@ LDFLAGS     := -X main.version=$(VERSION) -X main.commit=$(GIT_COMMIT)
 AWS_PROFILE ?= aws
 export AWS_PROFILE
 
+# Worker image (the one Python boundary, build step 5). Device is injected by the
+# control plane at run time, not baked in — cuda now, neuron the day TorchNeuron GAs.
+PYTHON       ?= python3
+WORKER_IMAGE ?= foray-worker:dev
+WORKER_DEVICE ?= cuda
+
 .DEFAULT_GOAL := help
 
 ## help: list targets
@@ -61,10 +67,27 @@ demo-fake:
 license-check:
 	@bash scripts/license-check.sh
 
-## worker: build the nnsight worker image
+## worker: build the nnsight worker image (LanguageModel + VLLM, one image)
 .PHONY: worker
 worker:
-	@echo "note: worker image not implemented yet (build step 5). See issues."
+	docker build -t $(WORKER_IMAGE) --build-arg FORAY_DEVICE=$(WORKER_DEVICE) -f worker/Dockerfile .
+
+## worker-test: pytest the worker under FORAY_FAKE=1 (no GPU, no AWS) — CI gate
+.PHONY: worker-test
+worker-test:
+	@echo "==> worker-test: pytest with FORAY_FAKE=1 (no GPU, no AWS)"
+	FORAY_FAKE=1 $(PYTHON) -m pytest worker/tests -q
+
+## worker-fake: run the worker locally in fake mode (uvicorn on :8000)
+.PHONY: worker-fake
+worker-fake:
+	FORAY_FAKE=1 $(PYTHON) -m uvicorn worker.app:app --host 127.0.0.1 --port 8000
+
+## worker-smoke: MANUAL real GPU/AWS smoke — never run in CI (see worker/README.md)
+.PHONY: worker-smoke
+worker-smoke:
+	@echo "==> worker-smoke: real GPU + AWS (gpt2 logit-lens -> S3). Not a CI target."
+	$(PYTHON) -m worker.smoke
 
 ## deploy: IaC up (S3+CloudFront, API GW+Lambda, IAM, Cedar, DDB)
 .PHONY: deploy
