@@ -25,13 +25,15 @@ WORKER_DEVICE ?= cuda
 help:
 	@grep -E '^## ' $(MAKEFILE_LIST) | sed 's/## //' | awk -F: '{printf "  \033[1m%-14s\033[0m%s\n", $$1, $$2}'
 
-## build: build foray + forayd
+## build: build foray + forayd + foray-web
 .PHONY: build
 build:
 	@mkdir -p $(BIN)
 	$(GO) build -ldflags "$(LDFLAGS)" -o $(BIN)/foray ./cmd/foray
 	@if [ -d ./cmd/forayd ]; then $(GO) build -ldflags "$(LDFLAGS)" -o $(BIN)/forayd ./cmd/forayd; \
 	 else echo "note: cmd/forayd not implemented yet (build step 4)"; fi
+	@if [ -d ./cmd/foray-web ]; then $(GO) build -ldflags "$(LDFLAGS)" -o $(BIN)/foray-web ./cmd/foray-web; \
+	 else echo "note: cmd/foray-web not implemented yet (build step 8)"; fi
 
 ## lint: gofmt + go vet + staticcheck
 .PHONY: lint
@@ -61,6 +63,12 @@ test:
 demo-fake:
 	@echo "==> demo-fake: walking the loop with FORAY_FAKE=1 (no AWS)"
 	FORAY_FAKE=1 $(GO) run ./cmd/foray run "why does the model store France as Paris?" --yes
+
+## web-fake: serve the page + brain-loop API offline (FORAY_FAKE, no AWS)
+.PHONY: web-fake
+web-fake:
+	@echo "==> web-fake: serving web/ + /api over the fake loop on http://localhost:8090 (no AWS)"
+	FORAY_FAKE=1 $(GO) run ./cmd/foray-web
 
 ## license-check: verify every source file carries an Apache header
 .PHONY: license-check

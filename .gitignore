@@ -3,6 +3,7 @@
 /dist/
 /foray
 /forayd
+/foray-web
 *.exe
 *.test
 *.out
