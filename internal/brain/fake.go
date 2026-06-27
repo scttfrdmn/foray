@@ -16,9 +16,9 @@ package brain
 
 import (
 	"context"
-	"fmt"
 
 	"github.com/scttfrdmn/foray/internal/sizing"
+	"github.com/scttfrdmn/foray/internal/spore"
 )
 
 // Fakes for FORAY_FAKE=1: a deterministic GPT-2 -> 8B ladder so the whole
@@ -26,9 +26,25 @@ import (
 // CI gate (make demo-fake). The findings are canned but honest in shape: the
 // cheap rung shows the effect, the next confirms it scales.
 
-// NewFake builds a Brain wired with offline collaborators.
+// NewFake builds a Brain wired with offline collaborators. It launches through a
+// fresh spore fake spawn so the executor produces real, lookup-able session ids
+// (the CLI's gateway tracer resolves them via Spawn.Status).
 func NewFake() *Brain {
-	return &Brain{Plan: fakePlanner{}, Policy: fakePolicy{}, Exec: fakeExecutor{}}
+	return NewFakeWith(spore.NewFake().Spawn)
+}
+
+// NewFakeWith builds the offline Brain over a caller-supplied spawn so the CLI
+// can share one fake spawn between the brain's SpawnExecutor and the gateway's
+// idle bridge — the launched session then exists for KeepWarm/Status. The
+// planner, policy, and interpreter stay canned; only the executor is real, so
+// the offline loop exercises the same SpawnExecutor code the real path uses.
+func NewFakeWith(sp spore.Spawn) *Brain {
+	return &Brain{
+		Plan:   fakePlanner{},
+		Policy: fakePolicy{},
+		Exec:   SpawnExecutor{Spawn: sp},
+		Interp: fakeInterpreter{},
+	}
 }
 
 type fakePlanner struct{}
@@ -93,25 +109,43 @@ func (fakePolicy) Permit(_ context.Context, r *Rung) (bool, string) {
 	return true, ""
 }
 
-type fakeExecutor struct{}
+// fakeInterpreter is the offline Interpreter: it frames a canned finding against
+// the question per rung. Both fake findings are positive (EffectPresent: true)
+// so the offline ladder climbs — the honest-negative path is exercised by unit
+// tests that hand Assess an EffectPresent:false result directly.
+type fakeInterpreter struct{}
 
-func (fakeExecutor) Execute(_ context.Context, _ Question, r *Rung) (string, error) {
-	return fmt.Sprintf("fake-session-r%d", r.Index), nil
+func (fakeInterpreter) Interpret(_ context.Context, _ Question, r *Rung, raw RawResult) (*Result, error) {
+	return &Result{
+		Rung:          r.Index,
+		VizRef:        orStr(raw.VizRef, raw.SaveRef),
+		Finding:       fakeFinding(r.Index),
+		EffectPresent: true,
+	}, nil
 }
 
-// FakeResult returns a canned result for a rung so the loop can Assess and climb.
-func FakeResult(sessionID string, rungIndex int) *Result {
+// fakeFinding returns the canned, question-framed finding for a rung. The cheap
+// rung shows the effect; the next confirms it scales — canned but honest in
+// shape (ARCHITECTURE.md §6.2).
+func fakeFinding(rungIndex int) string {
 	findings := []string{
 		"GPT-2: the top token sharpens to 'Paris' by layer 9 (p≈0.41). The association is present even in a toy model.",
 		"Llama-3.1-8B: 'Paris' emerges around layer 20 (p≈0.78) — stronger and earlier-resolved. The effect scales.",
 	}
-	f := "result captured."
 	if rungIndex >= 0 && rungIndex < len(findings) {
-		f = findings[rungIndex]
+		return findings[rungIndex]
 	}
+	return "result captured."
+}
+
+// FakeResult returns a canned result for a rung so tests can Assess and climb
+// without going through the gateway. Both findings are positive, so the loop
+// climbs; the honest-negative gate is tested with a hand-built negative Result.
+func FakeResult(sessionID string, rungIndex int) *Result {
 	return &Result{
-		Rung:    rungIndex,
-		VizRef:  "s3://your-bucket/sessions/" + sessionID + "/saves/",
-		Finding: f,
+		Rung:          rungIndex,
+		VizRef:        "s3://your-bucket/sessions/" + sessionID + "/saves/",
+		Finding:       fakeFinding(rungIndex),
+		EffectPresent: true,
 	}
 }

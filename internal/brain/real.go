@@ -129,5 +129,6 @@ func NewReal(cfg Config) (*Brain, error) {
 		BudgetUSD:  cfg.BudgetUSD,
 	}
 	exec := SpawnExecutor{Spawn: cfg.Spawn, Region: cfg.Region, Spot: cfg.Spot}
-	return &Brain{Plan: planner, Policy: pol, Exec: exec}, nil
+	interp := &AgentCoreInterpreter{Invoker: cfg.Invoker}
+	return &Brain{Plan: planner, Policy: pol, Exec: exec, Interp: interp}, nil
 }

@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"sort"
 	"sync"
 	"time"
 )
@@ -148,6 +149,7 @@ func (s *fakeSpawn) Launch(_ context.Context, spec LaunchSpec) (Instance, error)
 		Region:       orDefault(spec.Region, "us-east-1"),
 		State:        "running",
 		PublicDNS:    spec.Name + ".fake.spore.host",
+		LaunchedAt:   s.now,
 		TTLDeadline:  s.now.Add(ttl),
 		IdleDeadline: s.now.Add(grace),
 	}
@@ -163,6 +165,18 @@ func (s *fakeSpawn) Status(_ context.Context, instanceID string) (Instance, erro
 		return Instance{}, errFakeUnknown
 	}
 	return inst, nil
+}
+
+func (s *fakeSpawn) List(_ context.Context) ([]Instance, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]Instance, 0, len(s.inst))
+	for _, inst := range s.inst {
+		out = append(out, inst)
+	}
+	// Deterministic order for the rehearsal (the map iteration order is not).
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out, nil
 }
 
 func (s *fakeSpawn) Terminate(_ context.Context, instanceID string) error {

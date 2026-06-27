@@ -61,6 +61,12 @@ const FakeSessionID = "sess-fake000001"
 // last_request_time across runs of make demo-fake.
 var fakeNow = time.Date(2026, 1, 1, 0, 5, 0, 0, time.UTC)
 
+// NewFakeWorker returns the canned worker on its own, so a caller (the CLI)
+// can build a Gateway over its own store + spawn — e.g. a MemStore seeded with
+// the sessions the brain just launched, rather than NewFake's single pre-seeded
+// session. Same no-egress guarantee: it returns references, never tensors.
+func NewFakeWorker() Worker { return fakeWorker{} }
+
 // fakeWorker returns a stable result reference — pixels and an s3:// save ref,
 // never tensors, honoring the no-automatic-egress invariant even offline.
 type fakeWorker struct{}

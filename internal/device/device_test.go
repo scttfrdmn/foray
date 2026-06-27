@@ -68,6 +68,24 @@ func TestOptionsTierFit(t *testing.T) {
 	}
 }
 
+func TestByInstanceType(t *testing.T) {
+	o, ok := ByInstanceType("g7e.2xlarge")
+	if !ok {
+		t.Fatal("g7e.2xlarge should resolve to an enabled option")
+	}
+	if o.Tier != TierMid || o.Backend != BackendNVIDIA {
+		t.Errorf("g7e.2xlarge = %+v, want mid/nvidia", o)
+	}
+	if _, ok := ByInstanceType("no-such.instance"); ok {
+		t.Error("unknown instance type should not resolve")
+	}
+	// The slice tier resolves too — the smallest/cheapest default for the expert
+	// path when --hardware is omitted.
+	if o, ok := ByInstanceType("g7e.xlarge"); !ok || o.Tier != TierSlice {
+		t.Errorf("g7e.xlarge = %+v, ok=%v, want slice", o, ok)
+	}
+}
+
 func TestOptionsSortedByTier(t *testing.T) {
 	opts := Options(16)
 	for i := 1; i < len(opts); i++ {

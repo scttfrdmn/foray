@@ -193,3 +193,45 @@ func TestFakeSpawnValidates(t *testing.T) {
 		t.Error("want error when InstanceType missing")
 	}
 }
+
+func TestSpawnListArgsAndFilter(t *testing.T) {
+	// spawn list returns a mix; List scopes to foray-named instances only.
+	r := &stubRunner{out: []byte(`[
+	  {"instance_id":"i-1","name":"foray-rung0-gpt2","instance_type":"g7e.xlarge","state":"running"},
+	  {"instance_id":"i-2","name":"someone-elses-job","instance_type":"g7.xlarge","state":"running"}
+	]`)}
+	sp := NewSpawn(r)
+
+	got, err := sp.List(context.Background())
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if !r.hasFlagValue("-o", "json") || !r.hasArg("list") {
+		t.Errorf("list args = %v", r.gotArgs)
+	}
+	if len(got) != 1 || got[0].ID != "i-1" {
+		t.Fatalf("List should scope to foray sessions, got %+v", got)
+	}
+}
+
+func TestFakeSpawnList(t *testing.T) {
+	ctx := context.Background()
+	sp := NewFake().Spawn
+	if _, err := sp.Launch(ctx, LaunchSpec{Name: "foray-rung0-gpt2", InstanceType: "g7e.xlarge"}); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+	if _, err := sp.Launch(ctx, LaunchSpec{Name: "foray-rung1-llama", InstanceType: "g7e.2xlarge"}); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+	got, err := sp.List(ctx)
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("List = %d instances, want 2", len(got))
+	}
+	// Launch stamps LaunchedAt so sessions can compute age / $-so-far.
+	if got[0].LaunchedAt.IsZero() {
+		t.Errorf("LaunchedAt not set: %+v", got[0])
+	}
+}

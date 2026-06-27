@@ -69,11 +69,26 @@ type Proposal struct {
 	Rung    *Rung
 }
 
-// Result is the outcome of running a rung, framed against the question.
+// RawResult is the brain-local view of what a trace yields: references to saved
+// values, never the values themselves. It mirrors gateway.TraceResult without
+// importing it, so the brain keeps no dependency on the gateway (the CLI bridges
+// the two). No tensor field ever belongs here — honoring the no-automatic-egress
+// invariant (CLAUDE.md, ARCHITECTURE.md §6.1).
+type RawResult struct {
+	SaveRef string // s3:// in-region; the saved activations/outputs
+	VizRef  string // rendered viz reference (pixels, not tensors)
+	NNSight string // the generated code that produced this trace
+}
+
+// Result is a rung's outcome interpreted against the question. EffectPresent is
+// the honest-negative signal the brain reads in Assess: false means the lower
+// rung showed no effect, so don't pay to confirm nothing on a larger one. The
+// brain produces this (Interpret); it never decides acceptance from it.
 type Result struct {
-	Rung    int
-	VizRef  string
-	Finding string
+	Rung          int
+	VizRef        string
+	Finding       string
+	EffectPresent bool
 }
 
 // Decision is the brain's post-result recommendation. It is advice, never an
@@ -109,12 +124,22 @@ type Executor interface {
 	Execute(ctx context.Context, q Question, r *Rung) (sessionID string, err error)
 }
 
-// Brain wires the three seams. It proposes and interprets; Approve (the human's
+// Interpreter turns a rung's raw trace references into a Result framed against
+// the question: a finding and the honest-negative signal (EffectPresent) Assess
+// reads. Backed by Bedrock in prod (the LLM interprets, never touches the money
+// path); a canned interpreter offline. This is how the brain "interprets" —
+// distinct from accepting, which only the human's Go does.
+type Interpreter interface {
+	Interpret(ctx context.Context, q Question, r *Rung, raw RawResult) (*Result, error)
+}
+
+// Brain wires the four seams. It proposes and interprets; Approve (the human's
 // "Go") is the only place a rung runs.
 type Brain struct {
 	Plan   Planner
 	Policy Policy
 	Exec   Executor
+	Interp Interpreter
 }
 
 // Propose plans the ladder for a question and returns the first thing to put in
@@ -155,19 +180,42 @@ func (b *Brain) Approve(ctx context.Context, l *Ladder, p *Proposal) (string, er
 	return sid, nil
 }
 
+// Interpret turns a rung's raw trace references into a Result framed against the
+// question. It delegates to the Interpreter seam and stamps the rung index so
+// the caller need not. This is the brain interpreting a result — it neither
+// advances the ladder nor accepts; Assess recommends and the human decides.
+func (b *Brain) Interpret(ctx context.Context, l *Ladder, r *Rung, raw RawResult) (*Result, error) {
+	if r == nil {
+		return nil, fmt.Errorf("interpret: nil rung")
+	}
+	res, err := b.Interp.Interpret(ctx, l.Question, r, raw)
+	if err != nil {
+		return nil, fmt.Errorf("interpret rung %d: %w", r.Index, err)
+	}
+	res.Rung = r.Index
+	return res, nil
+}
+
 // Assess interprets a rung's result and recommends climbing or stopping. It is
 // a recommendation only — the brain never advances the ladder or declares
-// success itself. It stops at the top of the ladder, stops when the next rung
-// would exceed the per-question envelope, and (in prod) stops on an honest
-// negative rather than paying to confirm nothing.
+// success itself. It stops at the top of the ladder, stops on an honest negative
+// rather than paying to confirm nothing, and stops when the next rung would
+// exceed the per-question envelope.
 func (b *Brain) Assess(ctx context.Context, l *Ladder, res *Result) (*Recommendation, error) {
 	next := res.Rung + 1
 	if next >= len(l.Rungs) {
 		return &Recommendation{Decision: Stop, Reason: "answered — the ladder is complete"}, nil
 	}
-	// Honest-negative hook: a real assessor stops here when the lower rung showed
-	// no effect ("likely absent — don't pay to confirm nothing"). The fake's
-	// findings are always positive, so it climbs.
+	// Honest negative: the lower rung showed no effect, so don't pay to confirm
+	// nothing on a larger model. This is checked before the budget gate — a null
+	// result stops the climb regardless of how much envelope is left.
+	if !res.EffectPresent {
+		return &Recommendation{
+			Decision: Stop,
+			Reason: fmt.Sprintf("no effect at %s; likely absent — don't pay for %s to confirm nothing",
+				l.Rungs[res.Rung].Model.Name, l.Rungs[next].Model.Name),
+		}, nil
+	}
 	if l.Spent+l.Rungs[next].EstCostUSD > l.Question.BudgetUSD {
 		return &Recommendation{
 			Decision: Stop,
