@@ -39,15 +39,17 @@ type Question struct {
 // Rung is one experiment in the ladder: a model + technique + engine + sized
 // hardware + cost estimate, plus the nnsight the worker will run.
 type Rung struct {
-	Index      int
-	Technique  string
-	Model      sizing.Model
-	Rationale  string
-	NNSight    string
-	Engine     sizing.Engine
-	Options    []sizing.Option // hardware that fits, tightest-first
-	Chosen     sizing.Option   // the option the brain picked (Options[0])
-	EstCostUSD float64
+	Index       int
+	Technique   string
+	Model       sizing.Model
+	ModelSource string // catalog kind: "hf" | "s3" | "upload" — the Cedar modelSource
+	Rationale   string
+	NNSight     string
+	Engine      sizing.Engine
+	Gradients   bool            // retains autograd graph; gates the Cedar large-save policy
+	Options     []sizing.Option // hardware that fits, tightest-first
+	Chosen      sizing.Option   // the option the brain picked (Options[0])
+	EstCostUSD  float64
 }
 
 // Ladder is the ordered, cheapest-first plan for a question. Cursor is the next
