@@ -35,18 +35,20 @@ type fakePlanner struct{}
 
 func (fakePlanner) PlanLadder(_ context.Context, question string) (*Ladder, *Proposal, error) {
 	gpt2 := Rung{
-		Index:     0,
-		Technique: "logit-lens",
-		Model:     sizing.Model{Name: "openai-community/gpt2", ParamsB: 0.124, BytesPer: 2, Layers: 12, HiddenDim: 768, CtxTokens: 1024},
-		Rationale: "cheapest model that could show the effect — cents to find out",
+		Index:       0,
+		Technique:   "logit-lens",
+		Model:       sizing.Model{Name: "openai-community/gpt2", ParamsB: 0.124, BytesPer: 2, Layers: 12, HiddenDim: 768, CtxTokens: 1024},
+		ModelSource: "hf",
+		Rationale:   "cheapest model that could show the effect — cents to find out",
 		NNSight: `with model.trace("The Eiffel Tower is in the city of"):
     layers = [model.transformer.h[i].output[0].save() for i in range(12)]`,
 	}
 	eight := Rung{
-		Index:     1,
-		Technique: "logit-lens",
-		Model:     sizing.Model{Name: "meta-llama/Llama-3.1-8B", ParamsB: 8, BytesPer: 2, Layers: 32, HiddenDim: 4096, CtxTokens: 8192},
-		Rationale: "confirm the effect scales beyond a toy model",
+		Index:       1,
+		Technique:   "logit-lens",
+		Model:       sizing.Model{Name: "meta-llama/Llama-3.1-8B", ParamsB: 8, BytesPer: 2, Layers: 32, HiddenDim: 4096, CtxTokens: 8192},
+		ModelSource: "hf",
+		Rationale:   "confirm the effect scales beyond a toy model",
 		NNSight: `with model.trace("The Eiffel Tower is in the city of"):
     layers = [model.model.layers[i].output[0].save() for i in range(32)]`,
 	}

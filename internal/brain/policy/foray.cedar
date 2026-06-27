@@ -16,32 +16,63 @@
 // Mirrors the aws-agentcore-demo AgentCore Gateway Cedar pattern: deny reasons
 // surface verbatim to the user. Policy, not code, governs what foray may launch.
 //
-// Entities (supplied by the Go evaluator as a proposal entity set):
-//   Experiment::"<id>"  attrs: { modelSource, instanceTier, estCostUSD, gradients, engine }
-//   User::"<sub>"       attrs: { budgetCeilingUSD, allowedTiers: Set<String>, allowLargeSaves }
+// Cedar is deny-by-default: a request is permitted only if some `permit` matches
+// and no `forbid` matches (a single matching forbid always wins). The Go
+// evaluator (internal/brain/cedar.go) reads the `@reason` annotation off the
+// matching `forbid` so the message the user sees is authored here, in policy —
+// not in Go. The `@id` annotation names each policy for that lookup.
 //
-// TODO(claude-code): finalize schema; wire the Cedar Go SDK in CedarPolicy.
-
-// Default deny — nothing launches unless a permit matches.
-forbid (principal, action, resource);
+// Entities (supplied by the Go evaluator as a proposal entity set):
+//   Experiment::"<id>"  attrs: {
+//     modelSource:  "hf" | "s3" | "upload"   (mirrors internal/catalog kinds)
+//     instanceTier: "slice" | "small" | "mid" | "large"  (internal/device tiers)
+//     estCostUSD:   decimal   ($/session estimate, truffle-priced)
+//     gradients:    bool      (retains autograd graph / forces eager + headroom)
+//     engine:       "eager" | "vllm" | "neuron"
+//   }
+//   User::"<sub>"  attrs: {
+//     budgetCeilingUSD: decimal       (per-session ceiling; distinct from the
+//                                       brain's per-question envelope — both hold)
+//     allowedTiers:     Set<String>   (which device tiers this principal may use)
+//     allowLargeSaves:  bool          (opt-in for gradients / full-residual saves)
+//     allowExport:      bool          (optional; absent ⇒ export allowed)
+//   }
+//
+// estCostUSD and budgetCeilingUSD are Cedar decimals; the Go evaluator builds
+// them with cedar.NewDecimalFromFloat so the `<=` comparison is exact.
 
 // Permit running an experiment within the user's budget and allowed tiers,
-// from an approved model source.
+// from an approved model source. One permit; the forbids below carve out the
+// hard limits that even a matching permit cannot override.
 permit (
     principal,
     action == Action::"run",
     resource is Experiment
 )
 when {
-    resource.estCostUSD <= principal.budgetCeilingUSD &&
+    resource.estCostUSD.lessThanOrEqual(principal.budgetCeilingUSD) &&
     principal.allowedTiers.contains(resource.instanceTier) &&
     (resource.modelSource == "hf" ||
      resource.modelSource == "s3" ||
      resource.modelSource == "upload")
 };
 
+// Over-budget is a hard limit with its own reason. The permit above also checks
+// the ceiling, but a permit that simply fails to match yields no message; this
+// forbid is what lets the brain surface "over budget" verbatim from policy.
+@id("forbid-over-budget")
+@reason("estimated $/session exceeds the per-session budget ceiling")
+forbid (
+    principal,
+    action == Action::"run",
+    resource is Experiment
+)
+when { resource.estCostUSD.greaterThan(principal.budgetCeilingUSD) };
+
 // Hard ceiling: the "large" tier (multi-GPU / 405B-class) requires explicit
 // opt-in, independent of budget — it is the easiest way to spend real money.
+@id("forbid-large-tier")
+@reason("instance tier large denied: requires explicit opt-in (allowedTiers must include \"large\")")
 forbid (
     principal,
     action == Action::"run",
@@ -52,6 +83,8 @@ unless { principal.allowedTiers.contains("large") };
 
 // Gradient / full-residual-stream captures force the eager path and large
 // activation headroom; gate them so a casual session can't silently size up.
+@id("forbid-gradients")
+@reason("gradient / large-save capture denied: requires allowLargeSaves opt-in")
 forbid (
     principal,
     action == Action::"run",
@@ -62,6 +95,8 @@ unless { principal.allowLargeSaves == true };
 
 // Trainium stays dark at the policy layer too until TorchNeuron GAs, regardless
 // of any beta env flag in the device registry.
+@id("forbid-neuron")
+@reason("neuron engine denied: Trainium support is GA-gated and not yet enabled")
 forbid (
     principal,
     action == Action::"run",
@@ -80,3 +115,24 @@ permit (
 )
 when { resource.owner == principal }
 unless { principal has allowExport && principal.allowExport == false };
+
+// Export denied when the requester is not the session owner. Named so the Go
+// evaluator can surface the reason verbatim.
+@id("forbid-export-not-owner")
+@reason("export denied: only the session owner may export its saved values")
+forbid (
+    principal,
+    action == Action::"export",
+    resource is Session
+)
+unless { resource.owner == principal };
+
+// Export denied by org data-residency policy (principal.allowExport == false).
+@id("forbid-export-residency")
+@reason("export denied: organization policy requires saved values stay in-region")
+forbid (
+    principal,
+    action == Action::"export",
+    resource is Session
+)
+when { principal has allowExport && principal.allowExport == false };

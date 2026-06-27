@@ -23,10 +23,15 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
+
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/bedrockruntime"
 
 	"github.com/scttfrdmn/foray/internal/brain"
 	"github.com/scttfrdmn/foray/internal/export"
+	"github.com/scttfrdmn/foray/internal/spore"
 )
 
 func main() {
@@ -67,17 +72,15 @@ func runCmd(ctx context.Context, args []string) {
 	)
 	_ = fs.Parse(args)
 	question := fs.Arg(0)
-	_, _, _, _, _ = model, technique, engine, hardware, budget // expert flags: TODO real wiring
+	_, _, _, _ = model, technique, engine, hardware // expert flags: full wiring is step 7
 
 	fake := os.Getenv("FORAY_FAKE") == "1"
 	if !fake {
-		fmt.Println("foray: real collaborators (AgentCore / Cedar / spawn) not wired yet.")
-		fmt.Println("       run with FORAY_FAKE=1 to walk the loop offline. See CLAUDE.md.")
+		runReal(ctx, question, *budget, *yes)
 		return
 	}
-	auto := fake || *yes
-	b := brain.NewFake()
 
+	b := brain.NewFake()
 	ladder, prop, err := b.Propose(ctx, question)
 	if err != nil {
 		die(err)
@@ -90,15 +93,11 @@ func runCmd(ctx context.Context, args []string) {
 	fmt.Printf("\n  question: %s\n", question)
 	fmt.Printf("  budget for this question: $%.2f\n", ladder.Question.BudgetUSD)
 
+	// In the fake, every rung is auto-approved so the CI gate walks the whole
+	// loop unattended. The real path always asks for an explicit Go.
 	for prop != nil {
 		printProposal(prop)
-		if !auto && !confirm("  Go?") {
-			fmt.Println("  stopped.")
-			break
-		}
-		if auto {
-			fmt.Println("  Go (auto)")
-		}
+		fmt.Println("  Go (auto)")
 
 		sid, err := b.Approve(ctx, ladder, prop)
 		if err != nil {
@@ -121,6 +120,93 @@ func runCmd(ctx context.Context, args []string) {
 
 	fmt.Printf("\n  receipt: %d rung(s) run · $%.2f of $%.2f spent on this question\n\n",
 		ladder.Cursor, ladder.Spent, ladder.Question.BudgetUSD)
+}
+
+// runReal walks the real brain: Bedrock plans the ladder, Cedar gates each rung,
+// the human's Go launches it via spawn. Streaming the trace and fetching results
+// runs through forayd + the worker; wiring that into the CLI is step 7, so this
+// path plans, gates, and launches the first rung, then reports the live session.
+func runReal(ctx context.Context, question string, budgetUSD float64, yes bool) {
+	b, err := buildRealBrain(budgetUSD)
+	if err != nil {
+		die(err)
+	}
+	ladder, prop, err := b.Propose(ctx, question)
+	if err != nil {
+		die(err)
+	}
+	if prop != nil && prop.Clarify != "" {
+		fmt.Printf("\n  foray needs to know first: %s\n\n", prop.Clarify)
+		return
+	}
+
+	fmt.Printf("\n  question: %s\n", question)
+	fmt.Printf("  budget for this question: $%.2f\n", ladder.Question.BudgetUSD)
+
+	printProposal(prop)
+	if !yes && !confirm("  Go?") {
+		fmt.Println("  stopped.")
+		return
+	}
+	sid, err := b.Approve(ctx, ladder, prop)
+	if err != nil {
+		die(err) // Cedar denials surface here with the policy reason verbatim.
+	}
+	fmt.Printf("  Go — launched session %s on %s\n", sid, prop.Rung.Chosen.InstanceType)
+	fmt.Printf("  the worker streams the trace via forayd; result-driven climbing lands with the gateway-wired CLI (step 7).\n")
+	fmt.Printf("\n  receipt: 1 rung launched · ~$%.2f of $%.2f budgeted for this question\n\n",
+		prop.Rung.EstCostUSD, ladder.Question.BudgetUSD)
+}
+
+// buildRealBrain wires the real brain from AWS config + the spore CLIs. The
+// planning model is a US inference profile id (FORAY_PLAN_MODEL, defaulting to a
+// current Claude profile); the Cedar principal's budget/tier opt-ins come from
+// the environment. Credentials and region resolve via the standard AWS chain.
+func buildRealBrain(budgetUSD float64) (*brain.Brain, error) {
+	ctx := context.Background()
+	cfg, err := config.LoadDefaultConfig(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("load AWS config (set AWS_PROFILE / credentials): %w", err)
+	}
+	modelID := envOr("FORAY_PLAN_MODEL", "us.anthropic.claude-sonnet-4-6")
+	invoker := brain.NewBedrockInvoker(bedrockruntime.NewFromConfig(cfg), modelID)
+
+	runner := spore.NewExecRunner()
+	principal := brain.Principal{
+		Subject:          envOr("FORAY_USER", "foray-user"),
+		BudgetCeilingUSD: envFloat("FORAY_BUDGET_CEILING", 5.00),
+		AllowedTiers:     []string{"slice", "small", "mid"}, // "large" requires explicit opt-in
+		AllowLargeSaves:  os.Getenv("FORAY_ALLOW_LARGE_SAVES") == "1",
+		AllowExport:      os.Getenv("FORAY_DENY_EXPORT") != "1",
+	}
+	if os.Getenv("FORAY_ALLOW_LARGE_TIER") == "1" {
+		principal.AllowedTiers = append(principal.AllowedTiers, "large")
+	}
+	return brain.NewReal(brain.Config{
+		Invoker:   invoker,
+		Truffle:   spore.NewTruffle(runner),
+		Spawn:     spore.NewSpawn(runner),
+		Principal: principal,
+		BudgetUSD: budgetUSD,
+		Region:    cfg.Region,
+		Spot:      true,
+	})
+}
+
+func envOr(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
+}
+
+func envFloat(key string, def float64) float64 {
+	if v := os.Getenv(key); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			return f
+		}
+	}
+	return def
 }
 
 func printProposal(p *brain.Proposal) {

@@ -72,8 +72,41 @@ prefix.
   worker-fake` (local uvicorn), and `make worker-smoke` (manual real GPU/AWS
   smoke, opt-in via `FORAY_GPU_SMOKE=1`, never run in CI — with a reproducible EC2
   recipe in `worker/README.md`).
+- `internal/brain` real path — AgentCore plan/execute + Cedar + the result-gated
+  ladder, behind the same `Planner`/`Policy`/`Executor` seams the fake uses, so
+  `FORAY_FAKE=1` and `make demo-fake` stay green offline (the CI gate is
+  untouched). `AgentCorePlanner` asks Bedrock (`Converse`, via the `Invoker` seam)
+  for a cheapest-first ladder — or a clarifying question when the ask
+  underdetermines the experiment — then sizes and prices each rung locally so the
+  LLM never touches the money path; rungs are ordered by `$/session` (smaller
+  model breaks a tie). `CedarPolicy` evaluates `foray.cedar` per rung via the
+  cedar-go SDK and surfaces deny reasons verbatim from each `forbid`'s `@reason`
+  annotation (budget ceiling, allowed tiers, the `large`-tier and gradient/
+  large-save opt-ins, the `neuron` GA gate). `CedarExportPolicy` does the same for
+  the `export` action (owner-only, org data-residency). `NewTrufflePricer` turns a
+  Spot `$/hour` quote into a `$/session` estimate; `SpawnExecutor` launches an
+  approved rung via spawn with TTL + idle guardrails. `NewReal(Config)` wires it
+  all; `BedrockInvoker` isolates the AWS SDK behind the `Invoker` seam. Closes
+  #17, #18, #34, #35, #43, #44, #45.
+- `cmd/foray`: the real `run` path is wired — it loads AWS config, builds the real
+  brain (planning model via `FORAY_PLAN_MODEL`, Cedar principal from the
+  environment), and plans → asks for an explicit Go → Cedar-gates → launches the
+  rung via spawn (result-driven climbing over forayd lands with the gateway-wired
+  CLI in step 7). `FORAY_FAKE=1` still walks the whole loop unattended.
 
 ### Changed
+
+- `internal/brain`: `Rung` gains `ModelSource` and `Gradients` so the Cedar
+  Experiment entity is faithful (additive; the fake sets them).
+- `internal/brain/policy/foray.cedar`: removed an unconditional `forbid` that
+  would have denied every request (Cedar is deny-by-default); added `@id`/
+  `@reason` annotations so deny messages are authored in policy, an explicit
+  over-budget `forbid`, and the two `export` forbids (non-owner, data-residency).
+  Decimal comparisons use `.lessThanOrEqual`/`.greaterThan` (Cedar decimals are
+  not `<=`-comparable).
+- First real third-party dependencies: `github.com/cedar-policy/cedar-go` and
+  `github.com/aws/aws-sdk-go-v2` (`config`, `service/bedrockruntime`). `go test
+  ./...` and `make demo-fake` remain fully offline.
 
 - CI: `go test ./...`, `go build ./...`/`go vet ./...`, and `make demo-fake` are
   now hard gates (dropped `continue-on-error`); `.golangci.yml` migrated to the
