@@ -27,10 +27,15 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"log/slog"
 	"net/http"
 	"os"
+	"time"
+
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 
 	"github.com/scttfrdmn/foray/internal/gateway"
 	"github.com/scttfrdmn/foray/internal/spore"
@@ -53,13 +58,13 @@ func main() {
 		g, _ = gateway.NewFake()
 		log.Info("forayd starting (FORAY_FAKE — in-memory, no AWS)", "version", version, "commit", commit, "addr", *addr)
 	} else {
-		// Real path: stdlib HTTP worker + spore.host spawn for the idle bridge.
-		// The session store is the prod DynamoDB-backed Store, wired with the
-		// deploy step (worker.go TODO). Until then forayd has no place to read the
-		// session<->instance mapping, so refuse rather than pretend.
-		log.Error("forayd: real session store not wired yet — run with FORAY_FAKE=1, or wait for the deploy step",
-			"version", version, "commit", commit)
-		os.Exit(1)
+		var err error
+		g, err = buildReal()
+		if err != nil {
+			log.Error("forayd: wire real gateway", "err", err, "version", version, "commit", commit)
+			os.Exit(1)
+		}
+		log.Info("forayd starting (real — DynamoDB store + HTTP worker)", "version", version, "commit", commit, "addr", *addr)
 	}
 
 	srv := &http.Server{Addr: *addr, Handler: g.Handler(log)}
@@ -67,4 +72,27 @@ func main() {
 		log.Error("forayd: serve", "err", err)
 		os.Exit(1)
 	}
+}
+
+// buildReal wires the deployed gateway: a DynamoDB-backed session store, the
+// stdlib HTTP worker, and the DynamoDB idle-bridge shim. The gateway never
+// launches or terminates instances — it only routes traces and stamps
+// last_request_time — so it needs no exec-backed spawn (the `spawn` binary isn't
+// present in a Lambda runtime). Touch writes the durable idle signal to DynamoDB;
+// a spawn-side consumer reads it (ARCHITECTURE.md §6.1).
+func buildReal() (*gateway.Gateway, error) {
+	ctx := context.Background()
+	cfg, err := config.LoadDefaultConfig(ctx)
+	if err != nil {
+		return nil, err
+	}
+	table := os.Getenv("FORAY_SESSIONS_TABLE")
+	if table == "" {
+		table = "foray-sessions"
+	}
+	return &gateway.Gateway{
+		Store:  gateway.NewDynamoStore(dynamodb.NewFromConfig(cfg), table),
+		Worker: gateway.HTTPWorker{Client: &http.Client{Timeout: 10 * time.Minute}},
+		Spawn:  spore.NewDynamoIdleBridge(),
+	}, nil
 }

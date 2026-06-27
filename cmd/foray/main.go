@@ -30,6 +30,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"os"
 	"strconv"
@@ -38,6 +39,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/bedrockruntime"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 
 	"github.com/scttfrdmn/foray/internal/brain"
 	"github.com/scttfrdmn/foray/internal/catalog"
@@ -371,17 +373,16 @@ func buildExporter(ctx context.Context, session string) (*export.Exporter, error
 	if err != nil {
 		return nil, err
 	}
-	return &export.Exporter{Policy: pol, Presigner: stubPresigner{}}, nil
-}
-
-// stubPresigner stands in for the real S3Presigner (issue #25, deploy step). The
-// Cedar gate has already run by the time Presign is called, so a permitted export
-// reaches here and is told, honestly, that the download mechanism isn't wired —
-// rather than handed a fake URL that 404s.
-type stubPresigner struct{}
-
-func (stubPresigner) Presign(_ context.Context, sessionID string, _ export.Kind, _ time.Duration) (export.Link, error) {
-	return export.Link{}, fmt.Errorf("export of %s permitted by policy, but the S3 presigner is not wired yet (deploy step, #25)", sessionID)
+	bucket := os.Getenv("FORAY_DATA_BUCKET")
+	if bucket == "" {
+		return nil, errors.New("set FORAY_DATA_BUCKET to your in-region saves bucket to export")
+	}
+	cfg, err := config.LoadDefaultConfig(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("load AWS config (set AWS_PROFILE / credentials): %w", err)
+	}
+	presigner := export.NewS3Presigner(s3.NewFromConfig(cfg), bucket, slog.New(slog.NewTextHandler(os.Stderr, nil)))
+	return &export.Exporter{Policy: pol, Presigner: presigner}, nil
 }
 
 // --- collaborators ----------------------------------------------------------
