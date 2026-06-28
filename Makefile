@@ -101,6 +101,14 @@ TF_DIR    ?= deploy/terraform
 TF_VARS   ?= prod.tfvars
 BUILD     := build
 
+# The web-API Lambda shells out to truffle for Spot pricing (the spore "call the
+# tool, don't reimplement" rule). The binary isn't on the Lambda PATH, so we
+# cross-compile it from a local spore.host/truffle checkout and bundle it into
+# the zip under bin/ (lambda.tf puts /var/task/bin on PATH). A non-VPC Lambda
+# keeps default internet egress, so truffle's read-only EC2/pricing calls work
+# and the control plane stays ~$0 — no VPC, no endpoints, no NAT.
+TRUFFLE_SRC ?= ../spore-host/truffle
+
 ## deploy-check: fail on unresolved PLACEHOLDER_* / LICENSED_WORKLOAD_STUB (no AWS)
 .PHONY: deploy-check
 deploy-check:
@@ -108,12 +116,30 @@ deploy-check:
 
 ## lambdas: cross-compile forayd + foray-web for Lambda (provided.al2023/arm64)
 .PHONY: lambdas
-lambdas:
+lambdas: bundle-truffle
 	@mkdir -p $(BUILD)/forayd $(BUILD)/foray-web
 	GOOS=linux GOARCH=arm64 CGO_ENABLED=0 $(GO) build -ldflags "$(LDFLAGS)" -o $(BUILD)/forayd/bootstrap ./cmd/forayd
 	GOOS=linux GOARCH=arm64 CGO_ENABLED=0 $(GO) build -ldflags "$(LDFLAGS)" -o $(BUILD)/foray-web/bootstrap ./cmd/foray-web
+	# forayd never prices, so its zip stays truffle-free (flat: bootstrap only).
 	cd $(BUILD)/forayd && zip -q -j ../forayd.zip bootstrap
-	cd $(BUILD)/foray-web && zip -q -j ../foray-web.zip bootstrap
+	# foray-web carries bin/truffle alongside bootstrap, so drop -j (keep the
+	# bin/ path) — lambda.tf adds /var/task/bin to PATH for exec.LookPath.
+	cd $(BUILD)/foray-web && zip -q ../foray-web.zip bootstrap bin/truffle
+
+## bundle-truffle: cross-compile truffle into the foray-web Lambda payload
+.PHONY: bundle-truffle
+bundle-truffle:
+	@if [ ! -d "$(TRUFFLE_SRC)" ]; then \
+	  echo "error: TRUFFLE_SRC=$(TRUFFLE_SRC) not found."; \
+	  echo "  Point it at a spore.host/truffle checkout, e.g."; \
+	  echo "  make lambdas TRUFFLE_SRC=/path/to/spore-host/truffle"; \
+	  exit 1; \
+	fi
+	@mkdir -p $(BUILD)/foray-web/bin
+	# Strip symbols (-s -w): the binary only execs, never debugs, so shave the zip.
+	cd $(TRUFFLE_SRC) && GOOS=linux GOARCH=arm64 CGO_ENABLED=0 \
+	  $(GO) build -ldflags "-s -w" -o $(CURDIR)/$(BUILD)/foray-web/bin/truffle ./
+	@echo "==> bundled truffle: $$(file $(BUILD)/foray-web/bin/truffle | cut -d: -f2-)"
 
 ## deploy: IaC up (S3+CloudFront, API GW+Lambda, IAM, Cedar embedded, DDB)
 .PHONY: deploy

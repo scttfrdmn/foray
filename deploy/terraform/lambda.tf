@@ -91,6 +91,13 @@ resource "aws_lambda_function" "webapi" {
       FORAY_DATA_BUCKET    = aws_s3_bucket.data.bucket
       FORAY_PLAN_MODEL     = var.plan_model_id
       FORAY_BUDGET_CEILING = tostring(var.budget_ceiling_usd)
+      # The brain prices via truffle (the spore "call the tool" rule). truffle
+      # isn't on the stock Lambda PATH, so `make lambdas` bundles it under bin/
+      # in this zip and we prepend /var/task/bin (the unzipped code root) so
+      # spore's exec.LookPath finds it. No VPC needed: a non-VPC Lambda keeps
+      # default internet egress for truffle's read-only EC2/pricing calls, so
+      # /api/propose prices while the control plane stays ~$0.
+      PATH = "/var/task/bin:/usr/local/bin:/usr/bin:/bin"
     })
   }
 

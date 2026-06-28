@@ -26,6 +26,20 @@ prefix.
 
 ### Added
 
+- `deploy`: the `foray-web` Lambda now bundles the **truffle** binary so
+  `/api/propose` can price in the deployed control plane. `make lambdas`
+  cross-compiles truffle (`linux/arm64`, `CGO_ENABLED=0`, stripped) from a
+  spore.host/truffle checkout (`TRUFFLE_SRC`, default `../spore-host/truffle`)
+  into the zip under `bin/`; `lambda.tf` prepends `/var/task/bin` to `PATH` so
+  the spore exec runner's `LookPath` resolves it (no Go-adapter change — it
+  honors the "call the tool, don't reimplement" rule). The webapi IAM role gains
+  read-only Spot pricing actions (`ec2:DescribeSpotPriceHistory`,
+  `DescribeInstanceTypes`, `DescribeInstanceTypeOfferings`, `DescribeRegions`,
+  `pricing:GetProducts`). Stays ~$0: a non-VPC Lambda keeps default internet
+  egress, so no VPC/endpoints/NAT are needed. This closes the pricing half of
+  the deploy gap documented in PR #64; gateway→worker reachability remains a
+  filed follow-on.
+
 - `internal/gateway`: per-question cost receipts persisted to DynamoDB (#47).
   A `ReceiptStore` capability (optional, like `enumerator`) on `DynamoStore` and
   `MemStore` writes one row per approved rung under the reserved
