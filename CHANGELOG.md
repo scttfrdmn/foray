@@ -11,6 +11,19 @@ prefix.
 
 ## [Unreleased]
 
+### Fixed
+
+- `internal/brain`: `extractJSON` now repairs literal control characters (raw
+  newlines/tabs/CRs) inside JSON string values returned by the planning model.
+  Live Bedrock emits the generated `nnsight` as a multi-line value with
+  unescaped newlines, which `encoding/json` rejects (`invalid character '\n' in
+  string literal`) — surfaced only on the real deploy path; the canned fakes are
+  pre-escaped. Shared by the planner and interpreter.
+- `deploy/terraform/lambda.tf`: set `AWS_LWA_PORT` per-function (forayd `8080`,
+  foray-web `8090`) instead of one shared value. The two binaries bind different
+  default ports, so a single shared port left the web-API Lambda failing its LWA
+  readiness check — a silent `503 Service Unavailable` with no app-level error.
+
 ### Added
 
 - `internal/device`: accelerator/instance registry — `Tier` (slice/small/mid/

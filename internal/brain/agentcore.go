@@ -220,14 +220,55 @@ runnable against nnsight's LanguageModel API.`
 }
 
 // extractJSON pulls the first JSON object out of a model response, tolerating
-// stray prose or ```json fences a model may add despite instructions.
+// stray prose or ```json fences a model may add despite instructions, and
+// repairs the one malformation we see live: a model emitting a multi-line code
+// value (the generated nnsight) with *literal* newlines/tabs inside the JSON
+// string, which encoding/json rejects ("invalid character '\n' in string
+// literal"). The canned fakes are pre-escaped so this only bites the real path.
 func extractJSON(s string) string {
 	s = strings.TrimSpace(s)
 	// Strip a leading ```json / ``` fence if present.
 	if i := strings.Index(s, "{"); i >= 0 {
 		if j := strings.LastIndex(s, "}"); j >= i {
-			return s[i : j+1]
+			s = s[i : j+1]
 		}
 	}
-	return s
+	return escapeRawControlsInStrings(s)
+}
+
+// escapeRawControlsInStrings rewrites literal control characters (newline, tab,
+// carriage return) that appear *inside* JSON string literals into their escaped
+// forms, leaving control characters in structural whitespace untouched. A model
+// returning indented code as a JSON value produces exactly this; the JSON spec
+// forbids unescaped controls in strings, so we repair rather than reject.
+func escapeRawControlsInStrings(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	inString := false
+	escaped := false
+	for _, r := range s {
+		if inString && !escaped {
+			switch r {
+			case '\n':
+				b.WriteString(`\n`)
+				continue
+			case '\r':
+				b.WriteString(`\r`)
+				continue
+			case '\t':
+				b.WriteString(`\t`)
+				continue
+			}
+		}
+		switch {
+		case escaped:
+			escaped = false
+		case r == '\\' && inString:
+			escaped = true
+		case r == '"':
+			inString = !inString
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
 }

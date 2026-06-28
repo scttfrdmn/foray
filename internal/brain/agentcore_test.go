@@ -16,6 +16,7 @@ package brain
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 
 	"github.com/scttfrdmn/foray/internal/spore"
@@ -122,5 +123,47 @@ func TestAgentCoreBudgetStamp(t *testing.T) {
 	}
 	if ladder.Question.BudgetUSD != 2.50 {
 		t.Errorf("envelope = $%.2f, want $2.50", ladder.Question.BudgetUSD)
+	}
+}
+
+// TestExtractJSONRawControls verifies the live-path repair: a model returning a
+// multi-line code value with LITERAL newlines/tabs inside a JSON string (which
+// encoding/json rejects) is escaped so it parses, while structural whitespace
+// and already-escaped sequences are left intact. Regression for the real-deploy
+// "invalid character '\n' in string literal" failure.
+func TestExtractJSONRawControls(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+	}{
+		{"raw newline in value", "{\"nnsight\": \"with model.trace():\n  out.save()\"}"},
+		{"raw tab in value", "{\"nnsight\": \"a\tb\"}"},
+		{"fenced with raw newline", "```json\n{\"nnsight\": \"line1\nline2\"}\n```"},
+		{"already escaped stays valid", `{"nnsight": "line1\nline2"}`},
+		{"structural newlines only", "{\n  \"clarify\": \"which layers?\"\n}"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := extractJSON(tt.in)
+			var v map[string]any
+			if err := json.Unmarshal([]byte(got), &v); err != nil {
+				t.Fatalf("extractJSON output is not valid JSON: %v\n  got: %q", err, got)
+			}
+		})
+	}
+}
+
+// TestExtractJSONPreservesContent confirms the escaping round-trips the value:
+// the repaired string, once parsed, still carries the original newline.
+func TestExtractJSONPreservesContent(t *testing.T) {
+	got := extractJSON("{\"nnsight\": \"a\nb\"}")
+	var v struct {
+		NNSight string `json:"nnsight"`
+	}
+	if err := json.Unmarshal([]byte(got), &v); err != nil {
+		t.Fatal(err)
+	}
+	if v.NNSight != "a\nb" {
+		t.Errorf("value = %q, want %q", v.NNSight, "a\nb")
 	}
 }
