@@ -15,7 +15,7 @@
 #
 # HTTP API (not REST/v1): cheaper, no minimum, AWS_PROXY payload v2 that LWA
 # translates into a localhost HTTP call. Routes mirror the handlers' own muxes:
-#   ANY /api/{proxy+}        -> webapi  (POST /api/propose|approve|export)
+#   ANY /api/{proxy+}        -> webapi  (POST /api/propose|approve|export; GET /api/receipt)
 #   ANY /sessions/{proxy+}   -> forayd  (POST /sessions/{id}/trace)
 #   GET /healthz             -> webapi  (liveness)
 # CloudFront fronts this (cdn.tf) so the page and API share one origin and dodge

@@ -33,11 +33,11 @@ import (
 type fakeDynamo struct {
 	items map[string]map[string]types.AttributeValue // pk|sk -> item
 
-	getCalls, putCalls, updateCalls int
-	lastUpdate                      *dynamodb.UpdateItemInput
-	lastPut                         *dynamodb.PutItemInput
+	getCalls, putCalls, updateCalls, queryCalls int
+	lastUpdate                                  *dynamodb.UpdateItemInput
+	lastPut                                     *dynamodb.PutItemInput
 
-	getErr, putErr, updateErr error
+	getErr, putErr, updateErr, queryErr error
 }
 
 func newFakeDynamo() *fakeDynamo {
@@ -88,6 +88,31 @@ func (f *fakeDynamo) UpdateItem(_ context.Context, in *dynamodb.UpdateItemInput,
 		}
 	}
 	return &dynamodb.UpdateItemOutput{}, nil
+}
+
+// Query returns every stored item whose pk matches :pk and whose sk begins with
+// :sk — enough of the contract to exercise the receipt partition scan without a
+// real DynamoDB.
+func (f *fakeDynamo) Query(_ context.Context, in *dynamodb.QueryInput, _ ...func(*dynamodb.Options)) (*dynamodb.QueryOutput, error) {
+	f.queryCalls++
+	if f.queryErr != nil {
+		return nil, f.queryErr
+	}
+	pk, _ := in.ExpressionAttributeValues[":pk"].(*types.AttributeValueMemberS)
+	skPrefix, _ := in.ExpressionAttributeValues[":sk"].(*types.AttributeValueMemberS)
+	var out []map[string]types.AttributeValue
+	for _, item := range f.items {
+		ipk, _ := item["pk"].(*types.AttributeValueMemberS)
+		isk, _ := item["sk"].(*types.AttributeValueMemberS)
+		if pk == nil || ipk == nil || ipk.Value != pk.Value {
+			continue
+		}
+		if skPrefix != nil && isk != nil && !strings.HasPrefix(isk.Value, skPrefix.Value) {
+			continue
+		}
+		out = append(out, item)
+	}
+	return &dynamodb.QueryOutput{Items: out}, nil
 }
 
 func newTestStore() (*DynamoStore, *fakeDynamo) {

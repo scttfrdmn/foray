@@ -26,6 +26,19 @@ prefix.
 
 ### Added
 
+- `internal/gateway`: per-question cost receipts persisted to DynamoDB (#47).
+  A `ReceiptStore` capability (optional, like `enumerator`) on `DynamoStore` and
+  `MemStore` writes one row per approved rung under the reserved
+  `pk=QUESTION#<id>` / `sk=RECEIPT#<rung>` layout (same `expires` TTL, so it
+  self-cleans → $0); `QuestionID` derives a stable, whitespace/case-normalized
+  partition id from the question text so the stateless web client and the server
+  agree without carrying an id; `SummarizeReceipts` folds the rows into
+  `$-so-far vs envelope`. `RecordReceipt`/`LoadReceipts` are best-effort seams
+  (a lost receipt never fails a trace; a store without the capability no-ops).
+- `internal/webapi`: `/api/approve` now persists the receipt after each approved
+  rung, and a new `GET /api/receipt?question=<text>|id=<id>` returns the
+  authoritative persisted `$-so-far` so the page's cost meter survives a reload.
+  The SPA seeds its meter from this receipt on (re-)propose.
 - `internal/device`: accelerator/instance registry — `Tier` (slice/small/mid/
   large), `Backend`, `Option`, `Provider`, `Lookup`, and `Options(minHBM)` which
   returns enabled NVIDIA tiers that fit, sorted ascending. `neuron` is

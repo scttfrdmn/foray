@@ -19,6 +19,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 
@@ -222,6 +223,84 @@ func TestExportFake(t *testing.T) {
 	}
 	if !strings.Contains(got.URL, "presigned") || got.Kind != "bundle" {
 		t.Errorf("export = %+v, want a presigned bundle link", got)
+	}
+}
+
+// After an approve, the per-question receipt is persisted and GET /api/receipt
+// returns an authoritative $-so-far — the figure the page shows after a reload
+// when the live Ladder is gone. The receipt is looked up by question text (the
+// client never holds the derived id).
+func TestReceiptPersistedAfterApprove(t *testing.T) {
+	srv := newTestServer(t)
+	const question = "why does it store France as Paris?"
+
+	var planned proposeResp
+	postJSON(t, srv.URL+"/api/propose", proposeReq{Question: question}, &planned)
+
+	var r0 approveResp
+	postJSON(t, srv.URL+"/api/approve", approveReq{Ladder: planned.Ladder, RungIndex: 0}, &r0)
+
+	var rec receiptResp
+	resp, err := http.Get(srv.URL + "/api/receipt?question=" + url.QueryEscape(question))
+	if err != nil {
+		t.Fatalf("GET receipt: %v", err)
+	}
+	t.Cleanup(func() { _ = resp.Body.Close() })
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("receipt status = %d, want 200", resp.StatusCode)
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&rec); err != nil {
+		t.Fatalf("decode receipt: %v", err)
+	}
+	if rec.RungsRun != 1 {
+		t.Fatalf("RungsRun = %d after one approve, want 1", rec.RungsRun)
+	}
+	// The persisted spend matches what the approve response reported live.
+	if rec.SpentUSD != r0.SpentUSD {
+		t.Errorf("persisted spent %v != live spent %v", rec.SpentUSD, r0.SpentUSD)
+	}
+	if rec.BudgetUSD != r0.BudgetUSD {
+		t.Errorf("persisted budget %v != live budget %v", rec.BudgetUSD, r0.BudgetUSD)
+	}
+	if len(rec.Rungs) != 1 || rec.Rungs[0].Model == "" {
+		t.Errorf("receipt rows = %+v, want one rung with a model", rec.Rungs)
+	}
+}
+
+// An unasked question yields an empty receipt (zero spend), not an error — the
+// page can call it on first load without special-casing.
+func TestReceiptUnknownQuestionIsEmpty(t *testing.T) {
+	srv := newTestServer(t)
+	var rec receiptResp
+	resp := func() *http.Response {
+		r, err := http.Get(srv.URL + "/api/receipt?question=" + url.QueryEscape("never asked this"))
+		if err != nil {
+			t.Fatalf("GET receipt: %v", err)
+		}
+		t.Cleanup(func() { _ = r.Body.Close() })
+		return r
+	}()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&rec); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if rec.RungsRun != 0 || rec.SpentUSD != 0 {
+		t.Errorf("empty receipt = %+v, want zero spend", rec)
+	}
+}
+
+// A receipt request with neither id nor question is a 400.
+func TestReceiptMissingParam(t *testing.T) {
+	srv := newTestServer(t)
+	resp, err := http.Get(srv.URL + "/api/receipt")
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", resp.StatusCode)
 	}
 }
 
