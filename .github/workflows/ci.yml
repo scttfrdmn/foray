@@ -86,6 +86,20 @@ jobs:
       - run: ruff check worker
       - run: make worker-test
 
+  invariant:
+    name: invariant gates (no always-on, no auto-egress)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.26"
+      # #31: static guard — no always-on server/broker/cluster in go.mod or IaC.
+      - run: make invariant-check
+      # #32: reflective guard — no tensor-bearing field on any trace-result
+      # boundary (the only egress path is the user-initiated presigned export).
+      - run: go test ./internal/webapi/ -run TestNoTensorEgressBoundaries -v
+
   iac:
     name: terraform fmt + validate + deploy-check (no AWS)
     runs-on: ubuntu-latest

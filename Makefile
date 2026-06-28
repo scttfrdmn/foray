@@ -114,6 +114,11 @@ TRUFFLE_SRC ?= ../spore-host/truffle
 deploy-check:
 	@bash scripts/deploy-check.sh
 
+## invariant-check: fail if an always-on server/broker/cluster slips in (#31, no AWS)
+.PHONY: invariant-check
+invariant-check:
+	@bash scripts/invariant-check.sh
+
 ## lambdas: cross-compile forayd + foray-web for Lambda (provided.al2023/arm64)
 .PHONY: lambdas
 lambdas: bundle-truffle
