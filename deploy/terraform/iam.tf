@@ -119,6 +119,30 @@ resource "aws_iam_role_policy" "webapi_bedrock" {
   })
 }
 
+# Spot pricing for /api/propose. The brain prices each rung by shelling out to
+# the bundled truffle binary, whose `spot` path makes only read-only EC2 + AWS
+# Price List calls. None of these describe/list APIs support resource-level
+# scoping (no ARNs), so Resource is "*" — the actions themselves are read-only
+# and reveal only public pricing/capability data, never account secrets.
+resource "aws_iam_role_policy" "webapi_pricing" {
+  name = "truffle-spot-pricing"
+  role = aws_iam_role.webapi.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect = "Allow"
+      Action = [
+        "ec2:DescribeSpotPriceHistory",
+        "ec2:DescribeInstanceTypes",
+        "ec2:DescribeInstanceTypeOfferings",
+        "ec2:DescribeRegions",
+        "pricing:GetProducts",
+      ]
+      Resource = "*"
+    }]
+  })
+}
+
 # S3 on the session prefix ONLY — presign reads, bundle read/write. No
 # bucket-wide grant; the resource is sessions/* (issue #53). ListBucket is
 # conditioned to the sessions/ prefix so a presign can enumerate one session's

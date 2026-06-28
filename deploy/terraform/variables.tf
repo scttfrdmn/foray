@@ -69,6 +69,17 @@ variable "webapi_zip" {
   default     = "../../build/foray-web.zip"
 }
 
+# Documented for the deployer; consumed by the Makefile, not Terraform. The
+# web-API Lambda prices via the truffle binary (the spore "call the tool" rule),
+# which isn't on the stock Lambda PATH — `make lambdas TRUFFLE_SRC=<path>`
+# cross-compiles it from a spore.host/truffle checkout into the zip under bin/.
+# See README.md and the Makefile's bundle-truffle target.
+variable "truffle_src" {
+  description = "Local spore.host/truffle checkout the Makefile cross-compiles into the web-API Lambda zip (Makefile-consumed; not read by Terraform). Default ../spore-host/truffle."
+  type        = string
+  default     = "../spore-host/truffle"
+}
+
 variable "log_retention_days" {
   description = "CloudWatch log retention for the Lambdas (short — the control plane is cheap to observe)."
   type        = number

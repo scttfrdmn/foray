@@ -59,6 +59,22 @@ The layer ARN is **region-specific and versioned** — pin it in `prod.tfvars` f
 current public ARNs are listed at
 <https://github.com/awslabs/aws-lambda-web-adapter>.
 
+## Pricing (bundled truffle)
+
+The brain prices every rung by shelling out to **truffle** (the spore.host
+"call the tool, don't reimplement" rule — `internal/spore`). truffle is a local
+CLI, not on the stock Lambda `PATH`, so `make lambdas` cross-compiles it
+(`linux/arm64`, `CGO_ENABLED=0`) from a spore.host/truffle checkout
+(`TRUFFLE_SRC`, default `../spore-host/truffle`) and bundles it into the
+`foray-web` zip under `bin/`. `lambda.tf` prepends `/var/task/bin` (the unzipped
+code root) to `PATH` so `exec.LookPath("truffle")` resolves it.
+
+This needs **no VPC**: a non-VPC Lambda keeps default internet egress, so
+truffle's read-only EC2/Price-List calls reach AWS and `/api/propose` prices
+while the control plane stays ~$0 (no VPC endpoints, no NAT). The `foray-gateway`
+zip never prices, so it stays truffle-free. The IAM for these calls is on the
+`foray-webapi-lambda` role (above).
+
 ## IAM (least privilege)
 
 Three roles, each scoped to exactly what it needs.
@@ -79,6 +95,11 @@ Three roles, each scoped to exactly what it needs.
   bucket-wide grant), plus `ListBucket` **conditioned to the `sessions/*`
   prefix** so a presign can enumerate one session without listing the bucket.
 - `iam:PassRole` for the spawn role only, conditioned to `ec2.amazonaws.com`.
+- Read-only Spot pricing for `/api/propose`: `ec2:DescribeSpotPriceHistory`,
+  `DescribeInstanceTypes`, `DescribeInstanceTypeOfferings`, `DescribeRegions`,
+  and `pricing:GetProducts`. These describe/list APIs have no ARNs to scope to,
+  so `Resource = "*"`; they are read-only and expose only public
+  pricing/capability data. See **Pricing (bundled truffle)** below.
 
 ### `foray-spawn-instance` (issue #54)
 The least-privilege role a data-plane GPU instance assumes (via an instance
@@ -122,8 +143,21 @@ backend "s3" {
 
 ## Worker reachability (documented follow-on)
 
-The gateway Lambda POSTs traces to the worker at `http://<public_dns>:8000`. In
-production the gateway Lambda is expected to be **VPC-attached** (with VPC
-endpoints for DynamoDB and S3) so it reaches the GPU worker privately. That VPC
-plumbing is intentionally not in this first IaC pass — the real deploy is
-hand-validated (like `make worker-smoke`), and the trace path is exercised there.
+The gateway Lambda POSTs traces to the worker at `http://<public_dns>:8000`. The
+network path from a Lambda to that GPU worker is **not** in this IaC pass — the
+real trace round-trip is hand-validated (like `make worker-smoke`). Two shapes
+are on the table, and the choice is deliberately deferred until a GPU validates
+it:
+
+- **Public IP + per-session token (stays ~$0).** The worker requires a bearer
+  token; the gateway sends the session's token over the worker's public IP. No
+  VPC, no endpoints, no NAT — the token is the gate, and the worker is ephemeral
+  and single-tenant.
+- **Full VPC attach.** VPC-attach both Lambdas, a private worker subnet + SG
+  path, and interface endpoints (Bedrock/DynamoDB/S3). The stronger posture, but
+  the endpoints/NAT bill hourly — this **breaks the "control plane rests at ~$0"
+  invariant**, so it is not the default.
+
+Pricing used to be listed here as the same class of gap; it is **resolved** — see
+**Pricing (bundled truffle)** above. `/api/propose` prices in the deployed
+Lambda with no VPC.
