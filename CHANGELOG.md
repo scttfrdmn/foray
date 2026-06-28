@@ -26,6 +26,17 @@ prefix.
 
 ### Added
 
+- CI: two invariant gates now fail the build on a violation (issues #31, #32).
+  `scripts/invariant-check.sh` (`make invariant-check`) is a static guard for
+  the *control plane rests at ~$0* invariant — it scans `go.mod` for always-on
+  infra clients (broker/cluster/queue) and `deploy/terraform/` for always-on
+  resource types (`aws_instance`, ECS/EKS, RDS, load balancers, NAT gateways,
+  …) and requires the DynamoDB table to be `PAY_PER_REQUEST`. A new reflective
+  test `internal/webapi.TestNoTensorEgressBoundaries` enforces *no automatic
+  egress* — it reflects over every trace-result boundary struct
+  (`gateway.TraceResult`, `brain.RawResult`, `brain.Result`, `webapi.resultView`)
+  and fails if any field has a tensor-bearing type (`[]byte`, a numeric
+  slice/array, a map, or `interface{}`). Both run in a new `invariant` CI job.
 - `deploy`: the `foray-web` Lambda now bundles the **truffle** binary so
   `/api/propose` can price in the deployed control plane. `make lambdas`
   cross-compiles truffle (`linux/arm64`, `CGO_ENABLED=0`, stripped) from a
