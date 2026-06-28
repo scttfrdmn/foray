@@ -111,6 +111,20 @@ function setMeter(spentUSD) {
   setTimeout(() => v.classList.remove("tick"), 350);
 }
 
+/* Seed the meter from the question's persisted receipt — the authoritative
+   $-so-far across reloads (#47). GET, no side effects; a failure just leaves the
+   meter at $0 rather than blocking the propose flow. */
+async function seedMeterFromReceipt(question) {
+  try {
+    const r = await fetch("/api/receipt?question=" + encodeURIComponent(question));
+    if (!r.ok) { setMeter(0); return; }
+    const rec = await r.json();
+    setMeter(rec.spentUSD);
+  } catch {
+    setMeter(0);
+  }
+}
+
 /* ---- hero preview: a static, decorative logit-lens illustration on load ---- */
 function heroPreview() {
   $("#hero-prompt").innerHTML = "per-layer confidence climbs as the model resolves an answer";
@@ -280,7 +294,10 @@ async function propose(question) {
   }
 
   currentLadder = resp.ladder;
-  setMeter(0);
+  // Seed the meter from any spend already recorded for this question (a reload or
+  // a re-ask): the server's persisted receipt is authoritative, never a client
+  // sum. Falls back to $0 if nothing was spent or the lookup fails.
+  await seedMeterFromReceipt(question);
   $("#qline").innerHTML = "“" + esc(question) +
     "” <em>— cheapest experiment first; climb only if it's worth it.</em>";
   rungs.appendChild(rungCard(resp.proposal));

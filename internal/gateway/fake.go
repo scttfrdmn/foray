@@ -81,14 +81,19 @@ func (fakeWorker) Run(_ context.Context, _ string, _ Graph) (TraceResult, error)
 
 // MemStore is the in-memory session<->instance map for the fake and for local
 // runs. It implements the optional enumerator capability so /healthz can report
-// the freshest last_request_time. Safe for concurrent use.
+// the freshest last_request_time, and the ReceiptStore capability so the offline
+// loop persists per-question cost receipts just like DynamoStore. Safe for
+// concurrent use.
 type MemStore struct {
 	mu       sync.Mutex
 	sessions map[string]Session
+	receipts map[string][]Receipt // questionID -> rung receipts
 }
 
 // NewMemStore returns an empty in-memory store.
-func NewMemStore() *MemStore { return &MemStore{sessions: map[string]Session{}} }
+func NewMemStore() *MemStore {
+	return &MemStore{sessions: map[string]Session{}, receipts: map[string][]Receipt{}}
+}
 
 func (m *MemStore) Get(_ context.Context, sessionID string) (Session, error) {
 	m.mu.Lock()
@@ -130,4 +135,30 @@ func (m *MemStore) List(_ context.Context) ([]Session, error) {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 	return out, nil
+}
+
+// PutReceipt persists one rung's spend (the ReceiptStore capability). Re-writing
+// the same rung overwrites in place, matching DynamoStore's PutItem semantics so
+// a retried approve doesn't double-count.
+func (m *MemStore) PutReceipt(_ context.Context, r Receipt) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	rs := m.receipts[r.QuestionID]
+	for i := range rs {
+		if rs[i].Rung == r.Rung {
+			rs[i] = r
+			m.receipts[r.QuestionID] = rs
+			return nil
+		}
+	}
+	m.receipts[r.QuestionID] = append(rs, r)
+	return nil
+}
+
+// Receipts returns a question's rung receipts (the ReceiptStore capability). An
+// unknown question yields an empty slice, not an error.
+func (m *MemStore) Receipts(_ context.Context, questionID string) ([]Receipt, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]Receipt(nil), m.receipts[questionID]...), nil
 }

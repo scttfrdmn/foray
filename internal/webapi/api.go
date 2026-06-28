@@ -41,6 +41,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/scttfrdmn/foray/internal/brain"
 	"github.com/scttfrdmn/foray/internal/export"
@@ -57,6 +58,18 @@ type Deps struct {
 	Gateway  *gateway.Gateway
 	Spawn    spore.Spawn
 	Exporter *export.Exporter
+
+	// Now lets tests pin the clock for deterministic receipt timestamps; nil →
+	// time.Now. The handlers never sleep or schedule on it.
+	Now func() time.Time
+}
+
+// now returns the current time, honoring an injected clock for tests.
+func (d Deps) now() time.Time {
+	if d.Now != nil {
+		return d.Now()
+	}
+	return time.Now()
 }
 
 // Handler returns the JSON API surface. It is a stdlib ServeMux (Go 1.22
@@ -66,6 +79,7 @@ type Deps struct {
 //
 //	POST /api/propose   question → clarify | (ladder + first rung)
 //	POST /api/approve   ladder + rungIndex → launch, trace, interpret, assess, next
+//	GET  /api/receipt   question|id → persisted $-so-far for the question (#47)
 //	POST /api/export    sessionId + kind → presigned download (opt-in egress)
 //	GET  /healthz       liveness
 func Handler(d Deps, log *slog.Logger) http.Handler {
@@ -75,6 +89,7 @@ func Handler(d Deps, log *slog.Logger) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /api/propose", d.handlePropose(log))
 	mux.HandleFunc("POST /api/approve", d.handleApprove(log))
+	mux.HandleFunc("GET /api/receipt", d.handleReceipt(log))
 	mux.HandleFunc("POST /api/export", d.handleExport(log))
 	mux.HandleFunc("GET /healthz", handleHealthz)
 	return mux
@@ -211,6 +226,26 @@ func (d Deps) handleApprove(log *slog.Logger) http.HandlerFunc {
 			return
 		}
 
+		// Persist the per-question receipt so a page reload (the stateless contract
+		// discards the live Ladder) still shows an authoritative $-so-far. The
+		// brain already booked the spend in Approve; we record the fact, never
+		// settle acceptance. Best-effort: a lost receipt must not fail the trace.
+		receipt := gateway.Receipt{
+			QuestionID:   gateway.QuestionID(l.Question.Text),
+			QuestionText: l.Question.Text,
+			Rung:         rung.Index,
+			SessionID:    sid,
+			Technique:    rung.Technique,
+			Model:        rung.Model.Name,
+			EstCostUSD:   rung.EstCostUSD,
+			SpentUSD:     l.Spent,
+			BudgetUSD:    l.Question.BudgetUSD,
+			At:           d.now(),
+		}
+		if err := gateway.RecordReceipt(ctx, d.Gateway.Store, receipt); err != nil {
+			log.Warn("approve: record receipt", "session", sid, "rung", rung.Index, "err", err)
+		}
+
 		resp := approveResp{
 			SessionID:      sid,
 			Result:         viewResult(res, tr),
@@ -225,6 +260,79 @@ func (d Deps) handleApprove(log *slog.Logger) http.HandlerFunc {
 			if next := d.Brain.NextProposal(ctx, l); next != nil {
 				resp.NextProposal = viewRung(next.Rung)
 			}
+		}
+		writeJSON(w, http.StatusOK, resp)
+	}
+}
+
+// --- /api/receipt ------------------------------------------------------------
+
+// receiptResp is a question's persisted cost receipt for the page: rungs run and
+// dollars spent against the envelope, authoritative across reloads (the live
+// Ladder is gone between calls). Per-rung rows ride along so the page can show a
+// breakdown. References only — no tensors.
+type receiptResp struct {
+	QuestionID   string           `json:"questionId"`
+	QuestionText string           `json:"questionText"`
+	SpentUSD     float64          `json:"spentUSD"`
+	BudgetUSD    float64          `json:"budgetUSD"`
+	RungsRun     int              `json:"rungsRun"`
+	Rungs        []receiptRowView `json:"rungs"`
+}
+
+// receiptRowView is one approved rung's spend in the receipt.
+type receiptRowView struct {
+	Rung       int     `json:"rung"`
+	Model      string  `json:"model"`
+	Technique  string  `json:"technique"`
+	SessionID  string  `json:"sessionId"`
+	EstCostUSD float64 `json:"estCostUSD"`
+	SpentUSD   float64 `json:"spentUSD"`
+}
+
+// handleReceipt returns the persisted $-so-far for a question, looked up by the
+// stable QuestionID the client passes (?question=<text> or ?id=<id>). It is a
+// read of recorded facts — nothing launches, nothing is interpreted. When the
+// store can't keep receipts (the offline MemStore does; a future store might
+// not) it answers an empty receipt, not an error.
+func (d Deps) handleReceipt(log *slog.Logger) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		id := r.URL.Query().Get("id")
+		if id == "" {
+			if q := strings.TrimSpace(r.URL.Query().Get("question")); q != "" {
+				id = gateway.QuestionID(q)
+			}
+		}
+		if id == "" {
+			writeErr(w, http.StatusBadRequest, "id or question query parameter is required")
+			return
+		}
+		sum, _, err := gateway.LoadReceipts(r.Context(), d.Gateway.Store, id)
+		if err != nil {
+			log.Warn("receipt", "question", id, "err", err)
+			writeErr(w, http.StatusBadGateway, err.Error())
+			return
+		}
+		resp := receiptResp{
+			QuestionID:   sum.QuestionID,
+			QuestionText: sum.QuestionText,
+			SpentUSD:     sum.SpentUSD,
+			BudgetUSD:    sum.BudgetUSD,
+			RungsRun:     sum.RungsRun,
+			Rungs:        make([]receiptRowView, 0, len(sum.Rungs)),
+		}
+		if resp.QuestionID == "" {
+			resp.QuestionID = id // no rows yet — echo the asked-for id
+		}
+		for _, row := range sum.Rungs {
+			resp.Rungs = append(resp.Rungs, receiptRowView{
+				Rung:       row.Rung,
+				Model:      row.Model,
+				Technique:  row.Technique,
+				SessionID:  row.SessionID,
+				EstCostUSD: row.EstCostUSD,
+				SpentUSD:   row.SpentUSD,
+			})
 		}
 		writeJSON(w, http.StatusOK, resp)
 	}

@@ -28,11 +28,13 @@ import (
 
 // dynamoAPI is the minimal slice of the DynamoDB client the store uses — the
 // seam a fake replaces in tests (no AWS). Touch is one UpdateItem so the hot
-// path on every trace is a single write; Get/Put are GetItem/PutItem.
+// path on every trace is a single write; Get/Put are GetItem/PutItem; receipts
+// add Query (one question's rung rows under its partition).
 type dynamoAPI interface {
 	GetItem(ctx context.Context, in *dynamodb.GetItemInput, opts ...func(*dynamodb.Options)) (*dynamodb.GetItemOutput, error)
 	PutItem(ctx context.Context, in *dynamodb.PutItemInput, opts ...func(*dynamodb.Options)) (*dynamodb.PutItemOutput, error)
 	UpdateItem(ctx context.Context, in *dynamodb.UpdateItemInput, opts ...func(*dynamodb.Options)) (*dynamodb.UpdateItemOutput, error)
+	Query(ctx context.Context, in *dynamodb.QueryInput, opts ...func(*dynamodb.Options)) (*dynamodb.QueryOutput, error)
 }
 
 // DynamoStore is the prod session<->instance map (ARCHITECTURE.md §2/§6.1). It
@@ -169,4 +171,98 @@ func (s *DynamoStore) Touch(ctx context.Context, sessionID string, at time.Time)
 		return fmt.Errorf("dynamo touch %s: %w", sessionID, err)
 	}
 	return nil
+}
+
+// receiptItem is the persisted shape of a per-rung cost receipt. It lives in the
+// same table under the question's partition (pk=QUESTION#<id>, sk=RECEIPT#<rung>)
+// — the layout the schema reserved — so no second table is needed. `expires`
+// carries the same TTL as session rows, so a question's receipts self-clean and
+// resting cost stays at $0.
+type receiptItem struct {
+	PK           string    `dynamodbav:"pk"`
+	SK           string    `dynamodbav:"sk"`
+	QuestionID   string    `dynamodbav:"question_id"`
+	QuestionText string    `dynamodbav:"question_text"`
+	Rung         int       `dynamodbav:"rung"`
+	SessionID    string    `dynamodbav:"session_id"`
+	Technique    string    `dynamodbav:"technique"`
+	Model        string    `dynamodbav:"model"`
+	EstCostUSD   float64   `dynamodbav:"est_cost_usd"`
+	SpentUSD     float64   `dynamodbav:"spent_usd"`
+	BudgetUSD    float64   `dynamodbav:"budget_usd"`
+	At           time.Time `dynamodbav:"receipt_at"`
+	Expires      int64     `dynamodbav:"expires"`
+}
+
+// PutReceipt persists one approved rung's spend (the ReceiptStore capability). A
+// PutItem on (QUESTION#<id>, RECEIPT#<rung>): re-approving the same rung overwrites
+// rather than duplicates, so the question's total stays correct on a retry.
+func (s *DynamoStore) PutReceipt(ctx context.Context, r Receipt) error {
+	at := r.At
+	if at.IsZero() {
+		at = time.Now()
+	}
+	item, err := attributevalue.MarshalMap(receiptItem{
+		PK:           questionPK(r.QuestionID),
+		SK:           receiptSK(r.Rung),
+		QuestionID:   r.QuestionID,
+		QuestionText: r.QuestionText,
+		Rung:         r.Rung,
+		SessionID:    r.SessionID,
+		Technique:    r.Technique,
+		Model:        r.Model,
+		EstCostUSD:   r.EstCostUSD,
+		SpentUSD:     r.SpentUSD,
+		BudgetUSD:    r.BudgetUSD,
+		At:           at,
+		Expires:      at.Add(s.ttl).Unix(),
+	})
+	if err != nil {
+		return fmt.Errorf("dynamo put receipt %s/%d: marshal: %w", r.QuestionID, r.Rung, err)
+	}
+	if _, err := s.api.PutItem(ctx, &dynamodb.PutItemInput{
+		TableName: aws.String(s.table),
+		Item:      item,
+	}); err != nil {
+		return fmt.Errorf("dynamo put receipt %s/%d: %w", r.QuestionID, r.Rung, err)
+	}
+	return nil
+}
+
+// Receipts returns every rung receipt for a question (the ReceiptStore
+// capability). One Query over the question's partition restricted to RECEIPT#
+// rows; an absent question yields an empty slice, not an error. The caller folds
+// these with SummarizeReceipts.
+func (s *DynamoStore) Receipts(ctx context.Context, questionID string) ([]Receipt, error) {
+	out, err := s.api.Query(ctx, &dynamodb.QueryInput{
+		TableName:              aws.String(s.table),
+		KeyConditionExpression: aws.String("pk = :pk AND begins_with(sk, :sk)"),
+		ExpressionAttributeValues: map[string]types.AttributeValue{
+			":pk": &types.AttributeValueMemberS{Value: questionPK(questionID)},
+			":sk": &types.AttributeValueMemberS{Value: "RECEIPT#"},
+		},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("dynamo query receipts %s: %w", questionID, err)
+	}
+	receipts := make([]Receipt, 0, len(out.Items))
+	for _, raw := range out.Items {
+		var it receiptItem
+		if err := attributevalue.UnmarshalMap(raw, &it); err != nil {
+			return nil, fmt.Errorf("dynamo query receipts %s: unmarshal: %w", questionID, err)
+		}
+		receipts = append(receipts, Receipt{
+			QuestionID:   it.QuestionID,
+			QuestionText: it.QuestionText,
+			Rung:         it.Rung,
+			SessionID:    it.SessionID,
+			Technique:    it.Technique,
+			Model:        it.Model,
+			EstCostUSD:   it.EstCostUSD,
+			SpentUSD:     it.SpentUSD,
+			BudgetUSD:    it.BudgetUSD,
+			At:           it.At,
+		})
+	}
+	return receipts, nil
 }
