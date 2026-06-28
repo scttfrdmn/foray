@@ -21,11 +21,15 @@
 #
 # Both are per-invocation with no daemon state, so they rest at ~$0.
 
+# LWA proxies the API Gateway event to the binary over localhost. AWS_LWA_PORT
+# must match the port the binary actually listens on — and the two binaries pick
+# different defaults (forayd :8080, foray-web :8090), so the port is set
+# per-function below, not shared. A mismatch is a silent 503 ("app is not
+# ready") with no app-level error — readiness just never passes.
 locals {
   lwa_env = {
     AWS_LAMBDA_EXEC_WRAPPER      = "/opt/bootstrap"
     AWS_LWA_READINESS_CHECK_PATH = "/healthz"
-    AWS_LWA_PORT                 = "8080"
   }
 }
 
@@ -51,6 +55,7 @@ resource "aws_lambda_function" "forayd" {
 
   environment {
     variables = merge(local.lwa_env, {
+      AWS_LWA_PORT         = "8080" # cmd/forayd binds :8080
       FORAY_SESSIONS_TABLE = aws_dynamodb_table.sessions.name
     })
   }
@@ -81,6 +86,7 @@ resource "aws_lambda_function" "webapi" {
 
   environment {
     variables = merge(local.lwa_env, {
+      AWS_LWA_PORT         = "8090" # cmd/foray-web binds :8090
       FORAY_SESSIONS_TABLE = aws_dynamodb_table.sessions.name
       FORAY_DATA_BUCKET    = aws_s3_bucket.data.bucket
       FORAY_PLAN_MODEL     = var.plan_model_id
