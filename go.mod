@@ -9,7 +9,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/bedrockruntime v1.50.4
 	github.com/aws/aws-sdk-go-v2/service/dynamodb v1.59.0
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.104.0
-	github.com/cedar-policy/cedar-go v1.6.0
+	github.com/cedar-policy/cedar-go v1.8.0
 )
 
 require (
