@@ -321,7 +321,10 @@ func stopCmd(ctx context.Context, args []string) {
 		die(err)
 	}
 	if !*force && !confirm(fmt.Sprintf("  stop session %s?", sid)) {
-		fmt.Println("  left running (idle + TTL will still reap it).")
+		// Be precise about which deadline does what: idle only *stops* the
+		// instance (EBS keeps billing), TTL is what terminates it. Saying "idle
+		// will reap it" would promise $0 that does not arrive until TTL.
+		fmt.Println("  left running (idle will stop it; TTL terminates it).")
 		return
 	}
 	if err := d.spawn.Terminate(ctx, sid); err != nil {
