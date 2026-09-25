@@ -154,10 +154,16 @@ func runLoop(ctx context.Context, d *deps, ladder *brain.Ladder, prop *brain.Pro
 		// Fetch the rung's result through the gateway (forayd's library, hosted
 		// in-process). register maps the session→worker; trace routes the graph and
 		// bridges the idle signal; only references come back, never tensors.
-		if err := d.tracer.register(ctx, sid); err != nil {
+		if err := d.tracer.register(ctx, sid, prop.Rung); err != nil {
 			die(fmt.Errorf("register session: %w", err))
 		}
 		tr, err := d.tracer.trace(ctx, sid, prop.Rung)
+		// The tunnel's job ends with this rung's traces. Close it before anything
+		// can exit early below — the next rung launches its own instance, and a
+		// leaked ssh forward would outlive the session it belonged to.
+		if cerr := d.tracer.close(); cerr != nil {
+			fmt.Fprintf(os.Stderr, "  note: closing the worker tunnel for %s: %v\n", sid, cerr)
+		}
 		if err != nil {
 			die(fmt.Errorf("trace session %s: %w", sid, err))
 		}
@@ -409,25 +415,69 @@ func (d *deps) regionScope() []string {
 // tracer fetches a rung's result through the gateway library, in-process. It is
 // the CLI playing the role forayd plays as a Lambda: same Route, same idle bridge.
 type tracer struct {
-	gw    *gateway.Gateway
-	spawn spore.Spawn
+	gw     *gateway.Gateway
+	spawn  spore.Spawn
+	server spore.Server
+	device string
+
+	// svc is the current session's tunnel, held between register and close.
+	svc *spore.Service
 }
 
-// register maps a just-launched session to its worker so Route can resolve it.
-func (t *tracer) register(ctx context.Context, sid string) error {
-	inst, err := t.spawn.Status(ctx, sid)
+// register starts the worker on the session's instance and opens a tunnel to it,
+// then maps the session so Route can resolve it (issue #66).
+//
+// The worker is reached through `spawn service`, not over a public IP: it binds
+// the instance's loopback and only the SSH forward reaches it, so nothing is
+// exposed to the internet and no VPC/endpoint/NAT is needed to talk to it. The
+// URL spawn hands back is a localhost address carrying the worker's session
+// token; gateway.HTTPWorker splits the two apart.
+func (t *tracer) register(ctx context.Context, sid string, r *brain.Rung) error {
+	svc, err := t.server.Serve(ctx, spore.ServeSpec{
+		InstanceID: sid,
+		Command:    workerCommand(sid, r, t.device),
+	})
 	if err != nil {
-		return fmt.Errorf("look up session %s: %w", sid, err)
+		return fmt.Errorf("open a tunnel to the worker on %s: %w", sid, err)
 	}
-	url, err := workerURL(inst)
-	if err != nil {
-		return fmt.Errorf("look up session %s: %w", sid, err)
-	}
+	t.svc = svc
 	return t.gw.Store.Put(ctx, gateway.Session{
 		ID:         sid,
-		InstanceID: inst.ID,
-		WorkerURL:  url,
+		InstanceID: sid,
+		WorkerURL:  svc.URL,
 	})
+}
+
+// close tears down the session's tunnel. The instance itself is not touched —
+// its TTL and idle timeout own that, as they must: stopping a tunnel is a
+// request, and only the instance's own deadlines are a guarantee.
+func (t *tracer) close() error {
+	if t.svc == nil {
+		return nil
+	}
+	err := t.svc.Stop()
+	t.svc = nil
+	return err
+}
+
+// workerCommand is the argv `spawn service` runs on the instance. spawn
+// shell-quotes it and appends "--addr 127.0.0.1:0", so worker.serve binds a free
+// loopback port and announces it (see worker/serve.py).
+//
+// The session's configuration rides in front of the interpreter via env(1)
+// because `spawn service` has no --env flag — and it should not grow one for our
+// sake when the command is already a command.
+func workerCommand(sid string, r *brain.Rung, deviceTarget string) []string {
+	return []string{
+		"env",
+		"FORAY_SESSION_ID=" + sid,
+		"FORAY_MODEL_URI=" + r.Model.Name,
+		"FORAY_DEFAULT_ENGINE=" + string(r.Engine),
+		"FORAY_DEVICE=" + deviceTarget,
+		"FORAY_SAVE_BUCKET=" + os.Getenv("FORAY_DATA_BUCKET"),
+		"FORAY_SAVE_REGION=" + os.Getenv("AWS_REGION"),
+		"python3", "-m", "worker.serve",
+	}
 }
 
 // trace routes the rung's generated nnsight to the worker and returns the result
@@ -438,22 +488,6 @@ func (t *tracer) trace(ctx context.Context, sid string, r *brain.Rung) (gateway.
 		Engine:  string(r.Engine),
 		Payload: []byte(r.NNSight),
 	})
-}
-
-// workerURL is where the session's worker accepts graphs. The worker's FastAPI
-// server listens on :8000 (worker/README.md).
-//
-// A missing address is an error rather than a fallback. This used to substitute
-// the instance ID for an empty host, which produced a URL like
-// "http://i-0abc:8000" that can never resolve — and since spawn reports
-// public_ip (never the public_dns this once read), the host was *always* empty on
-// the real path. Failing here names the problem at registration instead of
-// surfacing it later as an inscrutable dial error.
-func workerURL(inst spore.Instance) (string, error) {
-	if inst.PublicIP == "" {
-		return "", fmt.Errorf("instance %s has no public address yet (state %q)", inst.ID, inst.State)
-	}
-	return "http://" + inst.PublicIP + ":8000", nil
 }
 
 // buildDeps wires the fake or real collaborators depending on FORAY_FAKE.
@@ -480,7 +514,7 @@ func buildFakeDeps(_ float64) (*deps, error) {
 		spawn:     f.Spawn,
 		truffle:   f.Truffle,
 		principal: brain.Principal{Subject: envOr("FORAY_USER", "foray-user"), AllowExport: true},
-		tracer:    &tracer{gw: gw, spawn: f.Spawn},
+		tracer:    &tracer{gw: gw, spawn: f.Spawn, server: f.Server, device: envOr("FORAY_DEVICE", "cuda")},
 	}, nil
 }
 
@@ -499,6 +533,9 @@ func buildRealDeps(budgetUSD float64) (*deps, error) {
 	runner := spore.NewExecRunner()
 	truffle := spore.NewTruffle(runner)
 	spawn := spore.NewSpawn(runner)
+	// The worker is reached through `spawn service`, which is a long-lived child
+	// process rather than a one-shot command, so it needs the Starter seam.
+	server := spore.NewServer(spore.NewExecStarter())
 	principal := buildPrincipal()
 
 	b, err := brain.NewReal(brain.Config{
@@ -524,7 +561,7 @@ func buildRealDeps(budgetUSD float64) (*deps, error) {
 		truffle:   truffle,
 		principal: principal,
 		region:    cfg.Region,
-		tracer:    &tracer{gw: gw, spawn: spawn},
+		tracer:    &tracer{gw: gw, spawn: spawn, server: server, device: envOr("FORAY_DEVICE", "cuda")},
 	}, nil
 }
 

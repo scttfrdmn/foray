@@ -12,6 +12,42 @@ interleaved with the forward pass on the session's ephemeral GPU, and returns
 The Go control plane (`forayd`) routes graphs to this server over the VPC. The wire
 contract is fixed by `internal/gateway/worker.go`; this server matches it verbatim.
 
+## How it is reached (`spawn service`)
+
+The worker is **not** exposed on a public port. `forayd` has no free network path
+to a GPU instance — VPC-attaching a Lambda to reach a private one pulls in
+interface endpoints and NAT, which bill hourly and break the "control plane rests
+at ~$0" invariant — so foray reaches the worker through spawn's own verb for this
+(issue #66):
+
+```
+spawn service --host <instance> -o json -- \
+  env FORAY_SESSION_ID=… FORAY_MODEL_URI=… python3 -m worker.serve
+```
+
+spawn appends `--addr 127.0.0.1:0`, runs the command on the instance, and forwards
+a local port to whatever the worker binds. The worker listens on **loopback only**
+and is reachable solely through that forward.
+
+`worker/serve.py` implements spawn's readiness contract
+(spawn `docs/service-readiness-contract.md`): after binding — never before, since
+the resolved port is the whole point — it prints exactly one line to stdout and
+flushes it.
+
+```json
+{"event":"ready","addr":"127.0.0.1:54321","token":"…","provenance":{"service":"foray-worker"}}
+```
+
+spawn carries the `token` into the URL it reports, and foray presents it back as
+`Authorization: Bearer <token>` on `/trace` (a header, so the credential stays out
+of logs and error strings; `?token=` is also accepted so the URL spawn prints
+works if a human pastes it). `/healthz` needs no token — a liveness probe that
+fails for want of a credential is a liveness probe that fails for the wrong
+reason.
+
+Binding anything but loopback is refused outright rather than honored: the tunnel
+is the only intended way in, and a typo should not quietly widen the blast radius.
+
 ## Wire contract
 
 | Endpoint | Request | Response |

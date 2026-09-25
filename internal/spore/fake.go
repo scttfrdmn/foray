@@ -31,6 +31,7 @@ var (
 	errFakeLaunch  = errors.New("spawn launch (fake): Name and InstanceType are required")
 	errFakeUnknown = errors.New("spawn (fake): unknown instance id")
 	errFakeWatch   = errors.New("lagotto watch (fake): InstanceType is required")
+	errFakeServe   = errors.New("spawn service (fake): InstanceID and Command are required")
 )
 
 // Fakes for FORAY_FAKE=1: deterministic pricing/launch/watch data so the whole
@@ -44,6 +45,7 @@ type Fake struct {
 	Truffle Truffle
 	Spawn   Spawn
 	Lagotto Lagotto
+	Server  Server
 }
 
 // Enabled reports whether the fake path is active (FORAY_FAKE=1).
@@ -57,12 +59,22 @@ func FromEnv() (f Fake, fake bool) {
 		return NewFake(), true
 	}
 	r := NewExecRunner()
-	return Fake{Truffle: NewTruffle(r), Spawn: NewSpawn(r), Lagotto: NewLagotto(r)}, false
+	return Fake{
+		Truffle: NewTruffle(r),
+		Spawn:   NewSpawn(r),
+		Lagotto: NewLagotto(r),
+		Server:  NewServer(NewExecStarter()),
+	}, false
 }
 
-// NewFake builds the offline trio.
+// NewFake builds the offline set.
 func NewFake() Fake {
-	return Fake{Truffle: fakeTruffle{}, Spawn: newFakeSpawn(), Lagotto: fakeLagotto{}}
+	return Fake{
+		Truffle: fakeTruffle{},
+		Spawn:   newFakeSpawn(),
+		Lagotto: fakeLagotto{},
+		Server:  &fakeServer{},
+	}
 }
 
 // --- truffle fake -----------------------------------------------------------
@@ -233,6 +245,50 @@ func (s *fakeSpawn) KeepWarm(_ context.Context, instanceID string, lastRequest t
 	}
 	s.idle[instanceID] = lastRequest.Add(grace)
 	return nil
+}
+
+// --- spawn service fake -----------------------------------------------------
+
+// fakeServer stands in for `spawn service`: it hands back a loopback URL with a
+// token, the same shape the real tunnel reports, so the offline loop exercises
+// the token-splitting path rather than a bare host:port that would hide it.
+type fakeServer struct {
+	mu   sync.Mutex
+	seq  int
+	open int // live tunnels, so a test can assert Stop() actually ran
+}
+
+func (s *fakeServer) Serve(_ context.Context, spec ServeSpec) (*Service, error) {
+	if spec.InstanceID == "" || len(spec.Command) == 0 {
+		return nil, errFakeServe
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.seq++
+	port := 54320 + s.seq
+	addr := fmt.Sprintf("127.0.0.1:%d", port)
+	s.open++
+	return &Service{
+		URL:        fmt.Sprintf("http://%s/?token=fake-token-%06d", addr, s.seq),
+		Addr:       addr,
+		InstanceID: spec.InstanceID,
+		stop: func() error {
+			s.mu.Lock()
+			defer s.mu.Unlock()
+			if s.open > 0 {
+				s.open--
+			}
+			return nil
+		},
+	}, nil
+}
+
+// OpenTunnels reports how many fake tunnels are currently open. Test-only
+// observability for "the session closed its tunnel".
+func (s *fakeServer) OpenTunnels() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.open
 }
 
 // --- lagotto fake -----------------------------------------------------------
