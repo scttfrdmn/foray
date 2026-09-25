@@ -28,21 +28,45 @@ FROM nvidia/cuda:12.6.2-cudnn-runtime-ubuntu24.04
 ARG FORAY_DEVICE=cuda
 ENV FORAY_DEVICE=${FORAY_DEVICE} \
     PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1
+    UV_NO_CACHE=1 \
+    # uv sync builds the environment at worker/.venv; put it first on PATH so the
+    # CMD below runs the resolved interpreter without an activation dance.
+    PATH="/app/worker/.venv/bin:${PATH}"
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends python3 python3-pip python3-venv \
+    && apt-get install -y --no-install-recommends python3 ca-certificates \
     && rm -rf /var/lib/apt/lists/*
+
+# uv is the project's Python toolchain (see worker/pyproject.toml). Copied from
+# the official image rather than curl|sh so the version is pinned and the build
+# fetches no scripts.
+COPY --from=ghcr.io/astral-sh/uv:0.12.19 /uv /usr/local/bin/uv
 
 WORKDIR /app
 
 # Install deps first for layer caching: the GPU stack is the slow layer.
-COPY worker/requirements.txt worker/requirements-gpu.txt ./worker/
-RUN python3 -m pip install --break-system-packages -r worker/requirements-gpu.txt
+#
+#   --locked   install exactly uv.lock, and fail if it is stale, so the image and
+#              CI cannot silently diverge
+#   --extra gpu  the torch/nnsight/vllm stack — the whole point of this image, and
+#              the one thing CI's environment does not have
+#   --no-dev   pytest/ruff are for developing the worker, not running it
+COPY worker/pyproject.toml worker/uv.lock ./worker/
+RUN uv sync --project worker --locked --extra gpu --no-dev
 
-# The worker package imports as `worker.*` from the build context root.
+# The worker package imports as `worker.*` from the build context root. The
+# repo-root .dockerignore excludes worker/.venv — without it a host venv would
+# land on top of the one uv just built.
 COPY worker/ ./worker/
 
 EXPOSE 8000
 # Single-tenant: the user's own code on the user's own GPU; no sandbox layer.
+#
+# This default serves on 0.0.0.0 for a container reached over a published port
+# (`docker run -p 8000:8000`), which is the manual smoke shape. It is NOT how the
+# CLI runs the worker: under `spawn service` (#66) foray runs
+# `python3 -m worker.serve`, which binds loopback and announces its port. Running
+# that inside a container needs host networking so the tunnel can reach it:
+#
+#   docker run --network host --gpus all foray-worker:dev python -m worker.serve
 CMD ["uvicorn", "worker.app:app", "--host", "0.0.0.0", "--port", "8000"]

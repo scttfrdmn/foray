@@ -11,6 +11,32 @@ prefix.
 
 ## [Unreleased]
 
+### Changed
+
+- The worker's Python is managed with **uv**. `worker/pyproject.toml` is now the
+  single source of truth for dependencies — base deps in `[project]`, the GPU stack
+  as a `gpu` extra, pytest/ruff as a `dev` dependency-group — and a committed
+  `worker/uv.lock` pins the resolution so CI, the image and a laptop install the
+  same thing. `worker/requirements.txt` and `worker/requirements-gpu.txt` are
+  removed.
+  - Make targets run through uv: `worker-sync` (new), `worker-test`, `worker-lint`
+    (new), `worker-fake`, `worker-smoke`, plus `worker-serve-fake` (new) which runs
+    the worker the way `spawn service` does so the readiness contract can be
+    eyeballed offline. uv runs from the repo root with `--project worker`, because
+    the package imports as `worker.*`.
+  - CI installs uv via the SHA-pinned `astral-sh/setup-uv` (the spore.host house
+    convention) and runs `uv sync --project worker --locked`, which **fails on a
+    stale lock** — a dependency change can no longer land without its lock update.
+  - `worker/Dockerfile` installs with `uv sync --locked --extra gpu --no-dev`
+    (pinned uv copied from its official image rather than fetched by a shell
+    script), so the image and CI cannot silently diverge and test tooling stays out
+    of a production image.
+  - New repo-root `.dockerignore`. The image builds from the repo root, so without
+    it a developer's `worker/.venv` would be copied over the environment `uv sync`
+    just built inside the image — a wrong-platform venv that fails at run time
+    rather than build time. It also keeps the Go artifacts and IaC state out of the
+    build context.
+
 ### Added
 
 - `internal/spore` + `worker/serve.py`: the CLI now reaches the GPU worker through

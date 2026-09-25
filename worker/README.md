@@ -85,15 +85,32 @@ Go registry (`internal/device/neuron.go`) and Cedar (`engine == "neuron"` forbid
 
 ## Develop & test (no GPU, no AWS)
 
-Heavy deps (`torch`/`nnsight`/`vllm`/`boto3`) are imported lazily inside the real
-paths, so the fake path and the unit tests need only the base requirements.
+Python here is managed with **[uv](https://docs.astral.sh/uv/)**.
+`worker/pyproject.toml` declares the dependencies and `worker/uv.lock` pins them,
+so CI, the image and your laptop resolve identically. There are no
+`requirements*.txt` files.
+
+Heavy deps (`torch`/`nnsight`/`vllm`) live in the **`gpu` extra** and are imported
+lazily inside the real paths, so the fake path and the unit tests need only the
+base set — no GPU, no AWS, no torch.
 
 ```bash
-python3 -m venv .venv && . .venv/bin/activate
-pip install -r worker/requirements.txt
+make worker-sync     # uv sync --project worker  (base + dev, from the lock)
 
 make worker-test     # pytest under FORAY_FAKE=1 — the CI gate
-make worker-fake     # run the server locally in fake mode (uvicorn on :8000)
+make worker-lint     # ruff
+make worker-fake     # the server in fake mode (uvicorn on :8000)
+make worker-serve-fake   # the way `spawn service` runs it: loopback + a readiness
+                         # line on stdout — handy for eyeballing the #66 contract
+```
+
+Run uv from the repo root with `--project worker` (what the Make targets do): the
+package imports as `worker.*`, so the repo root must be the working directory.
+
+The GPU stack installs only where there is a GPU:
+
+```bash
+uv sync --project worker --extra gpu     # the smoke box / the image
 ```
 
 Poke the fake server:

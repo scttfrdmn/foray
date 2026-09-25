@@ -1,0 +1,34 @@
+# Copyright 2026 Scott Friedman. Apache License 2.0.
+#
+# The worker image builds from the repo root (docker build -f worker/Dockerfile .)
+# because the package imports as `worker.*`. That makes the whole repo the build
+# context, so exclude everything the image has no use for — and, critically, the
+# local virtualenv.
+#
+# worker/.venv is the sharp edge: the Dockerfile creates the environment with
+# `uv sync` and then COPYs worker/ over it. Without this file a developer's host
+# venv (wrong platform, absolute paths baked in) would clobber the container's and
+# the image would fail at run time rather than build time.
+worker/.venv/
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Go build outputs and toolchain state — the image contains no Go.
+bin/
+build/
+dist/
+coverage.out
+coverage.html
+
+# Repo and IaC state, none of which belongs in an image layer.
+.git/
+.github/
+deploy/
+web/
+*.tfstate
+*.tfstate.backup
+.terraform/
