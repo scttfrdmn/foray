@@ -173,6 +173,20 @@ The one genuinely new piece. Responsibilities:
   so the next trace doesn't re-stream weights; since re-cold-start is seconds,
   the grace-vs-restream tradeoff is near-free either way.
 
+  The contract is **the timestamp, not the mechanism**. In practice the instance
+  resets its own idle timer: the worker's port is passed to spawn as
+  `--active-ports`, so an in-flight trace counts as activity in-instance with no
+  control-plane round-trip. (`spawn extend` is *not* the lever — it moves the hard
+  TTL, which would erode the per-session cost ceiling.)
+
+- **Reach the worker without exposing it.** The worker binds the instance's
+  loopback and is reached through `spawn service`, which forwards a local port to
+  it over SSH and hands back a URL carrying a per-session token. Nothing is
+  exposed to the internet, and no VPC/endpoint/NAT is needed — so the control
+  plane stays at ~$0. This is the CLI path; the deployed page, whose caller is a
+  Lambda that cannot hold a forward, is a documented follow-on (issue #66, and
+  `deploy/terraform/README.md` §"Worker reachability").
+
 This is the single load-bearing contract — see `internal/gateway/gateway.go`.
 
 ### 6.2 brain — Bedrock AgentCore (Go orchestration)

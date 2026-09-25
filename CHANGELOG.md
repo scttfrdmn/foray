@@ -11,6 +11,42 @@ prefix.
 
 ## [Unreleased]
 
+### Added
+
+- `internal/spore` + `worker/serve.py`: the CLI now reaches the GPU worker through
+  **`spawn service`** — spawn's verb for running a long-lived HTTP service on an
+  instance and tunneling to it (issue #66, the deploy gap's second half). The
+  worker binds the instance's **loopback** and is reachable only through an SSH
+  forward, so nothing is exposed to the internet, no security-group port opens,
+  and no VPC/interface endpoint/NAT is involved — the control plane stays at ~$0.
+  This supersedes the "public IP + bearer token" shape the issue originally
+  proposed, which would have been a weaker posture for the same money and would
+  have reimplemented what spawn already does.
+  - `spore.Server`/`ServeSpec`/`Service` wrap the verb, with a `Starter`/`Proc`
+    seam for the long-lived child process (`Runner` waits for exit, so it could
+    not host a held-open tunnel). `Serve` reads spawn's one-line JSON result for
+    `local_url` and bounds the wait with `--boot-timeout`
+    (`DefaultServeBootTimeout` 10m, since streaming weights dominates boot).
+    spawn's flags are terminated with `--` before the service command: spawn does
+    not disable flag interspersion, so `python3 -m worker.serve` would otherwise
+    be rejected for the `-m`.
+  - `worker/serve.py` implements spawn's readiness contract — bind, then announce
+    `{"event":"ready","addr":…,"token":…}` on one flushed line of stdout. It
+    **refuses to bind anything but loopback**, since the tunnel is the only
+    intended way in.
+  - `worker/app.py` requires that per-session token on `/trace`, accepting
+    `Authorization: Bearer …` (what foray sends) or `?token=…` (what the URL spawn
+    prints carries, so a pasted URL works), compared with `secrets.compare_digest`.
+    `/healthz` stays open.
+  - `gateway.HTTPWorker` splits the token out of the session's worker URL and
+    sends it as a header, so the credential never appears in the endpoint strings
+    that errors quote. The plain `http://host:8000` shape still works unchanged.
+  - `cmd/foray`'s `tracer` owns the tunnel: `register` opens it per rung and
+    `close` tears it down before the next rung launches its own instance, so a
+    forward never outlives its session. The instance lifecycle is untouched — its
+    TTL and idle timeout remain the guarantee, since stopping a tunnel is only a
+    request.
+
 ### Documentation
 
 - `README.md`: refreshed the project-status section, which still described steps
