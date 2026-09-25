@@ -45,18 +45,26 @@ type SpotQuote struct {
 	OnDemandHr   float64 `json:"on_demand_price"` // On-Demand $/hour, when truffle reports it
 }
 
-// Quota is an account's Service Quota for an instance family in a region.
+// Quota is an account's Service Quota for an instance family in a region. EC2
+// quotas are vCPU-denominated, which is why the numbers are vCPU counts and not
+// instance counts.
+//
+// The field names mirror truffle's quotaRow (truffle cmd/quotas.go): the earlier
+// `limit`/`in_use` guess matched nothing truffle emits, so every quota check
+// silently read 0/0.
 type Quota struct {
-	Family string  `json:"family"`
-	Region string  `json:"region"`
-	Limit  float64 `json:"limit"` // vCPU (EC2 quotas are vCPU-denominated) or instance count
-	InUse  float64 `json:"in_use"`
+	Family    string `json:"family"`
+	Region    string `json:"region"`
+	Limit     int32  `json:"quota_vcpus"`
+	InUse     int32  `json:"usage_vcpus"`
+	Available int32  `json:"available_vcpus"`
+	Status    string `json:"status"`
 }
 
 // truffle is the real adapter: it execs the CLI with `-o json` and parses the
-// result. The exact JSON field names are confirmed against live truffle output
-// when AWS credentials are available; the struct tags above encode the observed
-// convention. See TODO(verify-json).
+// result. The struct tags above are verified against truffle's own output types
+// (pkg/aws.SpotPriceResult, cmd/quotas.go quotaRow), not inferred — see
+// TestWireContract, which pins them against captured CLI output.
 type truffle struct{ run Runner }
 
 // NewTruffle returns a Truffle backed by the real truffle binary.
@@ -94,19 +102,33 @@ func (t truffle) Quota(ctx context.Context, family, region string) (Quota, error
 	return quotas[0], nil
 }
 
+// Discover lists the instance types matching a truffle query.
+//
+// `truffle find -o json` emits an array of instance-type *objects* (truffle
+// pkg/output Printer.PrintJSON over []aws.InstanceTypeResult), not an array of
+// names — decoding straight into []string failed outright on every real call.
+// One type appears once per region it is offered in, so names are de-duplicated
+// while preserving truffle's ranking order (the CLI has already sorted them, and
+// that order is the menu foray shows behind a hardware override).
 func (t truffle) Discover(ctx context.Context, query string) ([]string, error) {
 	out, err := t.run.Run(ctx, "truffle", "find", query, "-o", "json")
 	if err != nil {
 		return nil, fmt.Errorf("truffle find %q: %w", query, err)
 	}
-	var types []string
-	if err := json.Unmarshal(out, &types); err != nil {
+	var rows []struct {
+		InstanceType string `json:"instance_type"`
+	}
+	if err := json.Unmarshal(out, &rows); err != nil {
 		return nil, fmt.Errorf("truffle find %q: parse json: %w", query, err)
+	}
+	types := make([]string, 0, len(rows))
+	seen := make(map[string]bool, len(rows))
+	for _, r := range rows {
+		if r.InstanceType == "" || seen[r.InstanceType] {
+			continue
+		}
+		seen[r.InstanceType] = true
+		types = append(types, r.InstanceType)
 	}
 	return types, nil
 }
-
-// TODO(verify-json): truffle spot/quotas JSON field names are inferred from the
-// CLI's documented `-o json` convention and confirmed against live output once
-// AWS credentials are available. The fake (fake.go) is the source of truth for
-// tests, so this verification is decoupled from the package's green state.

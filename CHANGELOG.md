@@ -13,6 +13,47 @@ prefix.
 
 ### Fixed
 
+- `internal/spore`: the adapters' JSON contracts now match what the spore.host
+  CLIs actually emit. The tags were hand-inferred and marked
+  `TODO(verify-json)`, with the fake as the test source of truth — so four wrong
+  guesses decoded to zero values against real output while CI stayed green:
+  - **`Instance.PublicDNS` → `PublicIP`.** `spawn list -o json` reports
+    `public_ip` and has no `public_dns` key at all, so the worker URL was built
+    from an empty host on *every* real trace. The `host == "" → instance ID`
+    fallback in `cmd/foray` and `internal/webapi` turned that into an
+    unresolvable `http://i-0abc:8000` instead of an error; `workerURL` now
+    returns an error when there is no address.
+  - **`ttl_deadline`/`idle_deadline` → `ttl`/`idle_timeout`.** spawn reports
+    durations from launch, not absolute deadlines, so `foray sessions` silently
+    dropped its TTL column. `Instance.TTLDeadline()` now derives it from
+    `LaunchedAt + TTL`.
+  - **`Quota{limit, in_use}` → `{quota_vcpus, usage_vcpus, available_vcpus}`**
+    (truffle `quotaRow`). Every quota check read 0/0.
+  - **`Discover` parsed `[]string`.** `truffle find -o json` emits instance-type
+    *objects*, so the call failed outright; names are now extracted and
+    de-duplicated in truffle's ranking order.
+  - **`Status` now answers from `spawn list`, not `spawn status`.** The latter
+    proxies the in-instance `spored` daemon's own document over SSH/SSM — a
+    different shape, and unreachable from a cold Lambda. `spawn list` uses the
+    EC2 API and works wherever the control plane runs.
+
+  A new `internal/spore/wire_test.go` pins each contract against fixtures taken
+  from the *tools'* own emitting code, so the fake can no longer mask drift.
+
+- `internal/spore`: `KeepWarm` no longer shells out to `spawn extend`. That verb
+  moves the **hard TTL** (it rewrites `spawn:ttl` and the termination deadline),
+  not the idle timer, so it never did the idle bridge's job — and because TTL
+  accumulates from launch, calling it once per trace walked the hard terminate
+  deadline outward indefinitely, dissolving the guardrail that makes cost
+  per-session rather than per-hour. The correct mechanism is set at launch:
+  `LaunchSpec.ActivePorts` (new, wired to the worker's port by
+  `brain.SpawnExecutor`) puts that port under spawn's in-instance idle daemon,
+  which counts ESTABLISHED connections on it as activity and resets the idle
+  timer itself — so an in-flight trace keeps its own instance alive with no
+  control-plane round-trip. The load-bearing contract is unchanged: the durable
+  signal remains the per-session `last_request_time` the gateway writes
+  (ARCHITECTURE.md §6.1, "the timestamp, not the mechanism").
+
 - `internal/brain`: `extractJSON` now repairs literal control characters (raw
   newlines/tabs/CRs) inside JSON string values returned by the planning model.
   Live Bedrock emits the generated `nnsight` as a multi-line value with

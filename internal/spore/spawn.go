@@ -17,6 +17,7 @@ package spore
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -41,6 +42,16 @@ type Spawn interface {
 	KeepWarm(ctx context.Context, instanceID string, lastRequest time.Time) error
 }
 
+// IdleWatcher is an optional capability a Spawn may provide to report the
+// modeled in-instance idle deadline — the deadline spawn's agent maintains on
+// the box itself. The real CLI exposes no such field (which is why this is a
+// capability and not part of Spawn), so only the fake implements it: it lets a
+// test observe the effect a trace has on the idle timer without a GPU. Same
+// optional-capability shape as gateway's enumerator and ReceiptStore.
+type IdleWatcher interface {
+	IdleDeadline(instanceID string) (time.Time, bool)
+}
+
 // LaunchSpec is the instance foray asks spawn to summon for one session. It is
 // deliberately small: the brain has already chosen the tier (internal/device,
 // internal/sizing) and truffle has priced it; spawn just launches it with the
@@ -54,19 +65,93 @@ type LaunchSpec struct {
 	SpotMaxPrice string        // optional ceiling, paired with Spot
 	TTL          time.Duration // hard auto-terminate ceiling (--ttl)
 	IdleGrace    time.Duration // idle-timeout: short post-trace warmth (--idle-timeout)
+
+	// ActivePorts are TCP ports whose ESTABLISHED connections spawn's in-instance
+	// idle daemon counts as activity (--active-ports). This is the idle bridge's
+	// real mechanism: with the worker's port listed, a trace in flight resets the
+	// idle timer on the instance itself, so a model-holding-HBM worker is never
+	// reaped mid-trace and no per-request control-plane call is needed. See
+	// KeepWarm for why the old `spawn extend` mapping was wrong.
+	ActivePorts []int
 }
 
 // Instance is a spawn-managed instance handle.
+//
+// The field set mirrors what `spawn list -o json` actually reports (see
+// instanceWire) — notably spawn exposes a public *IP*, not a DNS name, and
+// reports TTL/idle as durations from launch rather than absolute deadlines.
+// Deadlines are derived here instead of parsed.
 type Instance struct {
-	ID           string    `json:"instance_id"`
-	Name         string    `json:"name"`
-	InstanceType string    `json:"instance_type"`
-	Region       string    `json:"region"`
-	State        string    `json:"state"` // pending | running | stopping | terminated | hibernated
-	PublicDNS    string    `json:"public_dns"`
-	LaunchedAt   time.Time `json:"launch_time"`   // when the instance started; backs session age + $-so-far. TODO(verify-json)
-	TTLDeadline  time.Time `json:"ttl_deadline"`  // hard terminate time
-	IdleDeadline time.Time `json:"idle_deadline"` // next idle reap time (rolled forward by KeepWarm)
+	ID           string
+	Name         string
+	InstanceType string
+	Region       string
+	State        string // pending | running | stopping | terminated | hibernated
+	PublicIP     string
+	PrivateIP    string
+	LaunchedAt   time.Time     // when the instance started; backs session age + $-so-far
+	TTL          time.Duration // hard-terminate budget, measured from LaunchedAt
+	IdleTimeout  time.Duration // idle window before spawn stops/hibernates the box
+}
+
+// TTLDeadline is the hard terminate time, derived from the launch time and the
+// TTL budget. spawn reports TTL as a duration from first launch, not as an
+// absolute timestamp, so there is nothing to parse — it is computed. Zero when
+// either input is unknown, which callers must treat as "no deadline to show"
+// rather than "expires at the epoch".
+func (i Instance) TTLDeadline() time.Time {
+	if i.LaunchedAt.IsZero() || i.TTL <= 0 {
+		return time.Time{}
+	}
+	return i.LaunchedAt.Add(i.TTL)
+}
+
+// instanceWire mirrors, field for field, the JSON object `spawn list -o json`
+// emits (spawn cmd/list.go outputJSON). It exists so the wire contract is
+// written down in one place and pinned by a test: the previous hand-inferred
+// tags on Instance guessed `public_dns`, `ttl_deadline` and `idle_deadline`,
+// none of which spawn emits, so they silently decoded to zero values — an empty
+// worker host and a missing TTL — while the fake supplied plausible data and
+// kept CI green.
+type instanceWire struct {
+	InstanceID   string `json:"instance_id"`
+	Name         string `json:"name"`
+	InstanceType string `json:"instance_type"`
+	Region       string `json:"region"`
+	State        string `json:"state"`
+	PublicIP     string `json:"public_ip"`
+	PrivateIP    string `json:"private_ip"`
+	LaunchTime   string `json:"launch_time"`  // RFC3339
+	TTL          string `json:"ttl"`          // Go duration string, e.g. "8h"; empty when unset
+	IdleTimeout  string `json:"idle_timeout"` // ditto
+}
+
+// instance converts a wire object to the domain handle. Unparseable durations
+// and timestamps degrade to zero rather than failing the whole call: spawn omits
+// them for an unmanaged or just-launched instance, and a session listing is more
+// useful with a missing column than with an error.
+func (w instanceWire) instance() Instance {
+	inst := Instance{
+		ID:           w.InstanceID,
+		Name:         w.Name,
+		InstanceType: w.InstanceType,
+		Region:       w.Region,
+		State:        w.State,
+		PublicIP:     w.PublicIP,
+		PrivateIP:    w.PrivateIP,
+	}
+	if w.LaunchTime != "" {
+		if t, err := time.Parse(time.RFC3339, w.LaunchTime); err == nil {
+			inst.LaunchedAt = t
+		}
+	}
+	if d, err := time.ParseDuration(w.TTL); err == nil {
+		inst.TTL = d
+	}
+	if d, err := time.ParseDuration(w.IdleTimeout); err == nil {
+		inst.IdleTimeout = d
+	}
+	return inst
 }
 
 // spawnAdapter is the real adapter: it execs the CLI with `-o json` and parses
@@ -96,27 +181,44 @@ func (s spawnAdapter) Launch(ctx context.Context, spec LaunchSpec) (Instance, er
 	if spec.IdleGrace > 0 {
 		args = append(args, "--idle-timeout", durStr(spec.IdleGrace))
 	}
+	if len(spec.ActivePorts) > 0 {
+		args = append(args, "--active-ports", joinPorts(spec.ActivePorts))
+	}
 	out, err := s.run.Run(ctx, "spawn", args...)
 	if err != nil {
 		return Instance{}, fmt.Errorf("spawn launch %s: %w", spec.Name, err)
 	}
-	var inst Instance
-	if err := json.Unmarshal(out, &inst); err != nil {
+	var wire instanceWire
+	if err := json.Unmarshal(out, &wire); err != nil {
 		return Instance{}, fmt.Errorf("spawn launch %s: parse json: %w", spec.Name, err)
 	}
-	return inst, nil
+	return wire.instance(), nil
 }
 
+// ErrInstanceNotFound is returned when spawn manages no instance with the given
+// ID — a terminated session, or one launched by another tool.
+var ErrInstanceNotFound = errors.New("spore: instance not found")
+
+// Status reports one instance's current state.
+//
+// It is derived from `spawn list`, deliberately NOT from `spawn status`:
+// `spawn status -o json` proxies the *in-instance* spored daemon's own status
+// document over SSH/SSM (spawn cmd/status.go passes `--output json` to the
+// remote spored and forwards its stdout verbatim). That document has a different
+// shape than the EC2-level listing, and reaching it needs a live SSH/SSM path to
+// the box — which a cold Lambda in the control plane does not have. `spawn list`
+// answers from the EC2 API, so it works from anywhere the control plane runs.
 func (s spawnAdapter) Status(ctx context.Context, instanceID string) (Instance, error) {
-	out, err := s.run.Run(ctx, "spawn", "status", instanceID, "-o", "json")
+	all, err := s.list(ctx)
 	if err != nil {
 		return Instance{}, fmt.Errorf("spawn status %s: %w", instanceID, err)
 	}
-	var inst Instance
-	if err := json.Unmarshal(out, &inst); err != nil {
-		return Instance{}, fmt.Errorf("spawn status %s: parse json: %w", instanceID, err)
+	for _, inst := range all {
+		if inst.ID == instanceID || inst.Name == instanceID {
+			return inst, nil
+		}
 	}
-	return inst, nil
+	return Instance{}, fmt.Errorf("spawn status %s: %w", instanceID, ErrInstanceNotFound)
 }
 
 // forayNamePrefix scopes List to instances this control plane launched (spawn
@@ -124,13 +226,9 @@ func (s spawnAdapter) Status(ctx context.Context, instanceID string) (Instance, 
 const forayNamePrefix = "foray-"
 
 func (s spawnAdapter) List(ctx context.Context) ([]Instance, error) {
-	out, err := s.run.Run(ctx, "spawn", "list", "-o", "json")
+	all, err := s.list(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("spawn list: %w", err)
-	}
-	var all []Instance
-	if err := json.Unmarshal(out, &all); err != nil {
-		return nil, fmt.Errorf("spawn list: parse json: %w", err)
+		return nil, err
 	}
 	// Scope to foray sessions: spawn may manage instances from other tools sharing
 	// the account. A foray session is named "foray-rung<n>-<model>" (see
@@ -144,6 +242,26 @@ func (s spawnAdapter) List(ctx context.Context) ([]Instance, error) {
 	return foray, nil
 }
 
+// list is the unfiltered `spawn list` call shared by List and Status. Status must
+// not apply the foray- name filter: it is asked about one known instance by ID,
+// and silently reporting "not found" for a correctly-named-by-someone-else box
+// would be a worse answer than the truth.
+func (s spawnAdapter) list(ctx context.Context) ([]Instance, error) {
+	out, err := s.run.Run(ctx, "spawn", "list", "-o", "json")
+	if err != nil {
+		return nil, fmt.Errorf("spawn list: %w", err)
+	}
+	var wire []instanceWire
+	if err := json.Unmarshal(out, &wire); err != nil {
+		return nil, fmt.Errorf("spawn list: parse json: %w", err)
+	}
+	all := make([]Instance, 0, len(wire))
+	for _, w := range wire {
+		all = append(all, w.instance())
+	}
+	return all, nil
+}
+
 func (s spawnAdapter) Terminate(ctx context.Context, instanceID string) error {
 	if _, err := s.run.Run(ctx, "spawn", "terminate", instanceID, "-o", "json"); err != nil {
 		return fmt.Errorf("spawn terminate %s: %w", instanceID, err)
@@ -151,42 +269,43 @@ func (s spawnAdapter) Terminate(ctx context.Context, instanceID string) error {
 	return nil
 }
 
-// KeepWarm bridges per-session request activity into spawn's idle signal. This
-// is the seam the gateway (forayd, step 4) will drive: spawn's native idle
-// detection (CPU/network/process) reads a model-holding-HBM worker as idle even
-// when it is exactly what we want alive between two traces. forayd tracks
-// last_request_time per session and calls KeepWarm so spawn extends the idle
-// deadline from *request* activity rather than OS heuristics (ARCHITECTURE.md
-// §6.1, the one load-bearing new contract).
+// KeepWarm records that a session is active so a model-holding-HBM worker is not
+// reaped between two traces (ARCHITECTURE.md §6.1). The seam is unchanged and
+// still load-bearing; what changed is the mechanism underneath it.
 //
-// We map it onto `spawn extend` today: roll the deadline forward from the most
-// recent request. The interface — KeepWarm(instanceID, lastRequest) — is the
-// stable contract; the exact spored mechanism (extend vs. a heartbeat file vs.
-// an active-port probe) is finalized when forayd lands and can change behind
-// this method without touching the gateway.
+// This used to shell out to `spawn extend <id> <grace>`, which was the wrong
+// lever twice over:
+//
+//  1. `spawn extend` moves the **hard TTL**, not the idle timer — it rewrites the
+//     `spawn:ttl` tag and the termination deadline (spawn cmd/extend.go). It has
+//     no effect whatsoever on idle reaping, so it never did the job this seam
+//     exists to do.
+//  2. Worse, TTL is cumulative from launch, so extending on *every trace* walked
+//     the hard terminate deadline outward indefinitely. That silently dissolves
+//     the guardrail that makes cost per-session rather than per-hour — a chatty
+//     session could outlive its own ceiling.
+//
+// The correct mechanism is in-instance and set at launch: LaunchSpec.ActivePorts
+// puts the worker's port under spawn's idle daemon, which counts ESTABLISHED
+// connections on it as activity and resets the idle timer itself
+// (spawn pkg/agent countActivePortConnections). A trace in flight therefore keeps
+// its own instance alive with no control-plane round-trip, and the idle window
+// after the last trace is exactly --idle-timeout.
+//
+// So there is deliberately no spawn call here. The durable record of activity is
+// the per-session last_request_time the gateway writes (gateway.Store.Touch),
+// which is what ARCHITECTURE.md §6.1 calls the contract — "the timestamp, not the
+// mechanism" — and what a spawn-side consumer reads. Keeping the method on the
+// interface keeps that contract explicit and leaves one place to hang a real
+// remote poke if spawn ever grows one.
 func (s spawnAdapter) KeepWarm(ctx context.Context, instanceID string, lastRequest time.Time) error {
-	grace := keepWarmGraceFrom(lastRequest, time.Now())
-	if _, err := s.run.Run(ctx, "spawn", "extend", instanceID, durStr(grace), "-o", "json"); err != nil {
-		return fmt.Errorf("spawn keep-warm %s: %w", instanceID, err)
-	}
+	_, _, _ = ctx, instanceID, lastRequest
 	return nil
 }
 
 // defaultKeepWarmGrace is the post-trace warmth window: keep the worker alive a
 // few minutes after the last request so the next trace doesn't re-stream
 // weights. Since re-cold-start is seconds (GDS), the grace-vs-restream tradeoff
-// is near-free either way (ARCHITECTURE.md §6.1).
+// is near-free either way (ARCHITECTURE.md §6.1). It is what callers pass as
+// LaunchSpec.IdleGrace, and the fake uses it to model the idle deadline.
 const defaultKeepWarmGrace = 5 * time.Minute
-
-// keepWarmGraceFrom computes how far past now the idle deadline should sit given
-// the last request time. A request that just happened earns the full grace; an
-// older request earns whatever grace remains, floored at a minimum so a single
-// late call still buys a moment of warmth rather than an immediate reap.
-func keepWarmGraceFrom(lastRequest, now time.Time) time.Duration {
-	const minGrace = 1 * time.Minute
-	grace := defaultKeepWarmGrace - now.Sub(lastRequest)
-	if grace < minGrace {
-		grace = minGrace
-	}
-	return grace
-}
