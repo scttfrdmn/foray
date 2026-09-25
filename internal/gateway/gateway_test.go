@@ -84,16 +84,24 @@ func TestRouteForwardsGraph(t *testing.T) {
 }
 
 // TestRouteBridgesIdle is the load-bearing assertion (ARCHITECTURE.md §6.1): a
-// trace must roll the worker's idle deadline forward from request activity, so a
-// model-holding-HBM worker isn't reaped between two traces. We assert both the
-// stored last_request_time and that spawn's idle deadline advanced past the
-// request time.
+// trace must keep a model-holding-HBM worker alive rather than let it be reaped
+// between two traces.
+//
+// Two things are checked, matching the two halves of the real mechanism: the
+// durable per-session last_request_time the gateway writes (the contract — "the
+// timestamp, not the mechanism"), and the instance's own idle deadline rolling
+// forward past the request, which on a real box is spawn's agent resetting its
+// idle timer because the trace holds a connection on an --active-ports port.
 func TestRouteBridgesIdle(t *testing.T) {
 	now := time.Date(2026, 6, 27, 12, 0, 0, 0, time.UTC)
 	w := &spyWorker{res: TraceResult{SaveRef: "s3://b/x"}}
 	g, sp, instID := newTestGateway(t, w, now)
 
-	before, _ := sp.Status(context.Background(), instID)
+	watcher, ok := sp.(spore.IdleWatcher)
+	if !ok {
+		t.Fatal("fake spawn should implement spore.IdleWatcher")
+	}
+	before, _ := watcher.IdleDeadline(instID)
 
 	if _, err := g.Route(context.Background(), "sess-1", Graph{Payload: []byte("g")}); err != nil {
 		t.Fatalf("Route: %v", err)
@@ -106,12 +114,12 @@ func TestRouteBridgesIdle(t *testing.T) {
 	}
 
 	// Idle deadline rolled forward past the request time — the worker survives.
-	after, _ := sp.Status(context.Background(), instID)
-	if !after.IdleDeadline.After(now) {
-		t.Errorf("idle deadline %v not after request %v — worker would be reaped", after.IdleDeadline, now)
+	after, _ := watcher.IdleDeadline(instID)
+	if !after.After(now) {
+		t.Errorf("idle deadline %v not after request %v — worker would be reaped", after, now)
 	}
-	if !after.IdleDeadline.After(before.IdleDeadline) {
-		t.Errorf("idle deadline did not advance: before %v, after %v", before.IdleDeadline, after.IdleDeadline)
+	if !after.After(before) {
+		t.Errorf("idle deadline did not advance: before %v, after %v", before, after)
 	}
 }
 

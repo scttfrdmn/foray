@@ -290,8 +290,8 @@ func sessionsCmd(ctx context.Context, args []string) {
 	for _, inst := range insts {
 		age := time.Since(inst.LaunchedAt)
 		ttl := "—"
-		if !inst.TTLDeadline.IsZero() {
-			ttl = humaneDur(time.Until(inst.TTLDeadline)) + " left"
+		if d := inst.TTLDeadline(); !d.IsZero() {
+			ttl = humaneDur(time.Until(d)) + " left"
 		}
 		fmt.Printf("  %-18s %-14s %-8s %-12s $%.2f\n",
 			inst.ID, inst.InstanceType, humaneDur(age), ttl, sessionCostSoFar(ctx, d.truffle, inst))
@@ -419,10 +419,14 @@ func (t *tracer) register(ctx context.Context, sid string) error {
 	if err != nil {
 		return fmt.Errorf("look up session %s: %w", sid, err)
 	}
+	url, err := workerURL(inst)
+	if err != nil {
+		return fmt.Errorf("look up session %s: %w", sid, err)
+	}
 	return t.gw.Store.Put(ctx, gateway.Session{
 		ID:         sid,
 		InstanceID: inst.ID,
-		WorkerURL:  workerURL(inst),
+		WorkerURL:  url,
 	})
 }
 
@@ -438,12 +442,18 @@ func (t *tracer) trace(ctx context.Context, sid string, r *brain.Rung) (gateway.
 
 // workerURL is where the session's worker accepts graphs. The worker's FastAPI
 // server listens on :8000 (worker/README.md).
-func workerURL(inst spore.Instance) string {
-	host := inst.PublicDNS
-	if host == "" {
-		host = inst.ID
+//
+// A missing address is an error rather than a fallback. This used to substitute
+// the instance ID for an empty host, which produced a URL like
+// "http://i-0abc:8000" that can never resolve — and since spawn reports
+// public_ip (never the public_dns this once read), the host was *always* empty on
+// the real path. Failing here names the problem at registration instead of
+// surfacing it later as an inscrutable dial error.
+func workerURL(inst spore.Instance) (string, error) {
+	if inst.PublicIP == "" {
+		return "", fmt.Errorf("instance %s has no public address yet (state %q)", inst.ID, inst.State)
 	}
-	return "http://" + host + ":8000"
+	return "http://" + inst.PublicIP + ":8000", nil
 }
 
 // buildDeps wires the fake or real collaborators depending on FORAY_FAKE.

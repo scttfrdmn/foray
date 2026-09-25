@@ -80,14 +80,18 @@ func TestTrufflePriceBadJSON(t *testing.T) {
 	}
 }
 
+// The fixture is the shape truffle's quotaRow actually emits (cmd/quotas.go):
+// vCPU-denominated quota_vcpus/usage_vcpus/available_vcpus. The previous fixture
+// invented `limit`/`in_use`, so it agreed with foray's wrong tags and the pair
+// passed while reading nothing from real output.
 func TestTruffleQuota(t *testing.T) {
-	r := &stubRunner{out: []byte(`[{"family":"G","region":"us-east-1","limit":128,"in_use":8}]`)}
+	r := &stubRunner{out: []byte(`[{"region":"us-east-1","family":"G","type":"spot","quota_vcpus":128,"usage_vcpus":8,"available_vcpus":120,"status":"ok"}]`)}
 	tr := NewTruffle(r)
 	q, err := tr.Quota(context.Background(), "G", "us-east-1")
 	if err != nil {
 		t.Fatalf("Quota: %v", err)
 	}
-	if q.Limit != 128 || q.InUse != 8 || q.Family != "G" {
+	if q.Limit != 128 || q.InUse != 8 || q.Available != 120 || q.Family != "G" {
 		t.Errorf("quota = %+v", q)
 	}
 	if !r.hasFlagValue("--family", "G") || !r.hasFlagValue("--regions", "us-east-1") {
@@ -103,15 +107,23 @@ func TestTruffleQuotaEmpty(t *testing.T) {
 	}
 }
 
+// `truffle find -o json` emits instance-type *objects*, one per type per region
+// it is offered in — not a list of names. Decoding into []string failed on every
+// real call. Names are de-duplicated in truffle's ranking order.
 func TestTruffleDiscover(t *testing.T) {
-	r := &stubRunner{out: []byte(`["g7e.xlarge","g7.xlarge"]`)}
+	r := &stubRunner{out: []byte(`[
+	  {"instance_type":"g7e.xlarge","region":"us-east-1","vcpus":4},
+	  {"instance_type":"g7e.xlarge","region":"us-west-2","vcpus":4},
+	  {"instance_type":"g7.xlarge","region":"us-east-1","vcpus":4}
+	]`)}
 	tr := NewTruffle(r)
 	types, err := tr.Discover(context.Background(), "nvidia gpu")
 	if err != nil {
 		t.Fatalf("Discover: %v", err)
 	}
-	if len(types) != 2 || types[0] != "g7e.xlarge" {
-		t.Errorf("types = %v", types)
+	want := []string{"g7e.xlarge", "g7.xlarge"}
+	if len(types) != len(want) || types[0] != want[0] || types[1] != want[1] {
+		t.Errorf("types = %v, want %v (deduped, order preserved)", types, want)
 	}
 	if r.gotArgs[0] != "find" || r.gotArgs[1] != "nvidia gpu" {
 		t.Errorf("args = %v", r.gotArgs)

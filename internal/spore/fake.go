@@ -17,6 +17,7 @@ package spore
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"sort"
 	"sync"
@@ -98,7 +99,7 @@ func (fakeTruffle) Price(_ context.Context, instanceType string, regions ...stri
 
 func (fakeTruffle) Quota(_ context.Context, family, region string) (Quota, error) {
 	// Plenty of headroom in the fake so the brain never trips a quota gate offline.
-	return Quota{Family: family, Region: region, Limit: 256, InUse: 0}, nil
+	return Quota{Family: family, Region: region, Limit: 256, InUse: 0, Available: 256, Status: "ok"}, nil
 }
 
 func (fakeTruffle) Discover(_ context.Context, _ string) ([]string, error) {
@@ -114,13 +115,31 @@ type fakeSpawn struct {
 	mu   sync.Mutex
 	seq  int
 	inst map[string]Instance
+	// idle models the *in-instance* idle deadline — the thing spawn's agent
+	// maintains on the box, not a field spawn reports over the CLI. Launch seeds
+	// it at now+grace and KeepWarm rolls it forward, which is faithful to how a
+	// trace actually stays alive: LaunchSpec.ActivePorts puts the worker's port
+	// under the idle daemon, so an in-flight trace resets that timer itself. The
+	// fake stands in for the daemon so tests can assert the effect the real
+	// system produces without a GPU. Read it with IdleDeadline.
+	idle map[string]time.Time
 	// now is fixed so the fake is deterministic (Date.now is non-deterministic
 	// and the demo must reproduce); tests can read deadlines relative to it.
 	now time.Time
 }
 
 func newFakeSpawn() *fakeSpawn {
-	return &fakeSpawn{inst: map[string]Instance{}, now: fakeEpoch}
+	return &fakeSpawn{inst: map[string]Instance{}, idle: map[string]time.Time{}, now: fakeEpoch}
+}
+
+// IdleDeadline reports the modeled in-instance idle deadline for an instance.
+// Test-only observability: the real spawn CLI exposes no such field, which is
+// exactly why it lives on the fake rather than on Instance.
+func (s *fakeSpawn) IdleDeadline(instanceID string) (time.Time, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	d, ok := s.idle[instanceID]
+	return d, ok
 }
 
 // fakeEpoch is a fixed reference time so launch/idle/TTL deadlines are stable
@@ -148,12 +167,18 @@ func (s *fakeSpawn) Launch(_ context.Context, spec LaunchSpec) (Instance, error)
 		InstanceType: spec.InstanceType,
 		Region:       orDefault(spec.Region, "us-east-1"),
 		State:        "running",
-		PublicDNS:    spec.Name + ".fake.spore.host",
-		LaunchedAt:   s.now,
-		TTLDeadline:  s.now.Add(ttl),
-		IdleDeadline: s.now.Add(grace),
+		// A documentation-range address (RFC 5737 TEST-NET-3), not a hostname:
+		// spawn reports public_ip and has no public_dns field at all. The fake
+		// deliberately hands back the same *shape* the real CLI does — supplying a
+		// plausible-looking value of the wrong shape is what let the empty-worker-
+		// host bug sit undetected behind a green test suite.
+		PublicIP:    fmt.Sprintf("203.0.113.%d", s.seq%254+1),
+		LaunchedAt:  s.now,
+		TTL:         ttl,
+		IdleTimeout: grace,
 	}
 	s.inst[inst.ID] = inst
+	s.idle[inst.ID] = s.now.Add(grace)
 	return inst, nil
 }
 
@@ -198,10 +223,15 @@ func (s *fakeSpawn) KeepWarm(_ context.Context, instanceID string, lastRequest t
 	if !ok {
 		return errFakeUnknown
 	}
-	// Roll the idle deadline forward to lastRequest + grace — the very thing the
-	// real adapter does via spawn extend, observable in the fake for tests.
-	inst.IdleDeadline = lastRequest.Add(defaultKeepWarmGrace)
-	s.inst[instanceID] = inst
+	// Model what a trace does to the instance's own idle timer: the connection on
+	// an --active-ports port counts as activity, so the deadline moves to
+	// lastRequest + the session's idle window. The real adapter makes no CLI call
+	// here precisely because the instance does this itself.
+	grace := inst.IdleTimeout
+	if grace == 0 {
+		grace = defaultKeepWarmGrace
+	}
+	s.idle[instanceID] = lastRequest.Add(grace)
 	return nil
 }
 

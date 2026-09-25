@@ -96,41 +96,52 @@ func TestSpawnTerminate(t *testing.T) {
 	}
 }
 
-func TestSpawnKeepWarmCallsExtend(t *testing.T) {
-	// The idle-bridge maps onto `spawn extend <id> <dur>`. Verify the verb and
-	// that a duration argument is present (its exact value is computed from
-	// lastRequest; see TestKeepWarmGraceFrom).
+// KeepWarm must not shell out to `spawn extend`. That verb moves the hard TTL
+// (spawn rewrites spawn:ttl and the termination deadline), not the idle timer, so
+// it never did the bridge's job — and because TTL accumulates from launch,
+// calling it once per trace walked the hard terminate deadline outward and
+// dissolved the per-session cost ceiling. The idle timer is reset on the instance
+// itself via LaunchSpec.ActivePorts; the durable signal is the gateway's
+// last_request_time row. This guards the regression, since reintroducing the call
+// would look superficially reasonable.
+func TestSpawnKeepWarmMakesNoExtendCall(t *testing.T) {
 	r := &stubRunner{out: []byte(`{}`)}
 	sp := NewSpawn(r)
 	if err := sp.KeepWarm(context.Background(), "i-abc", time.Now()); err != nil {
 		t.Fatalf("KeepWarm: %v", err)
 	}
-	if r.gotArgs[0] != "extend" || r.gotArgs[1] != "i-abc" {
-		t.Errorf("args = %v", r.gotArgs)
-	}
-	if len(r.gotArgs) < 3 || r.gotArgs[2] == "" {
-		t.Errorf("expected a duration arg: %v", r.gotArgs)
+	if r.gotArgs != nil {
+		t.Errorf("KeepWarm ran a spawn command (%v); it must not touch the TTL", r.gotArgs)
 	}
 }
 
-func TestKeepWarmGraceFrom(t *testing.T) {
-	now := fakeEpoch
-	tests := []struct {
-		name        string
-		lastRequest time.Time
-		want        time.Duration
-	}{
-		{"just now → full grace", now, defaultKeepWarmGrace},
-		{"2m ago → remaining grace", now.Add(-2 * time.Minute), defaultKeepWarmGrace - 2*time.Minute},
-		{"long ago → floored at minimum", now.Add(-1 * time.Hour), time.Minute},
+// The worker's port has to reach spawn's idle daemon as --active-ports, or a
+// trace in flight is read as idleness and the model-holding instance is reaped
+// mid-request.
+func TestSpawnLaunchPassesActivePorts(t *testing.T) {
+	r := &stubRunner{out: []byte(`{"instance_id":"i-abc","name":"foray-x","state":"running"}`)}
+	sp := NewSpawn(r)
+	_, err := sp.Launch(context.Background(), LaunchSpec{
+		Name:         "foray-x",
+		InstanceType: "g7e.xlarge",
+		ActivePorts:  []int{8000, 8001},
+	})
+	if err != nil {
+		t.Fatalf("Launch: %v", err)
 	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := keepWarmGraceFrom(tt.lastRequest, now); got != tt.want {
-				t.Errorf("keepWarmGraceFrom = %v, want %v", got, tt.want)
-			}
-		})
+	if got := argValue(r.gotArgs, "--active-ports"); got != "8000,8001" {
+		t.Errorf("--active-ports = %q, want %q (args %v)", got, "8000,8001", r.gotArgs)
 	}
+}
+
+// argValue returns the value following flag in args, or "" if absent.
+func argValue(args []string, flag string) string {
+	for i, a := range args {
+		if a == flag && i+1 < len(args) {
+			return args[i+1]
+		}
+	}
+	return ""
 }
 
 func TestFakeSpawnLifecycle(t *testing.T) {
@@ -144,9 +155,13 @@ func TestFakeSpawnLifecycle(t *testing.T) {
 	if inst.State != "running" || inst.ID == "" {
 		t.Fatalf("launched = %+v", inst)
 	}
-	// TTL and idle deadlines should sit ahead of the fake epoch.
-	if !inst.IdleDeadline.After(fakeEpoch) || !inst.TTLDeadline.After(fakeEpoch) {
-		t.Errorf("deadlines not in the future: %+v", inst)
+	// The instance carries a real-shaped public address (spawn reports an IP) and
+	// a TTL deadline derived from launch time + budget.
+	if inst.PublicIP == "" {
+		t.Error("launched instance has no PublicIP — the worker URL would be unbuildable")
+	}
+	if !inst.TTLDeadline().After(fakeEpoch) {
+		t.Errorf("TTL deadline not in the future: %v", inst.TTLDeadline())
 	}
 
 	got, err := sp.Status(ctx, inst.ID)
@@ -154,14 +169,19 @@ func TestFakeSpawnLifecycle(t *testing.T) {
 		t.Fatalf("Status = %+v, err %v", got, err)
 	}
 
-	// KeepWarm rolls the idle deadline to lastRequest + grace.
+	// A trace rolls the modeled in-instance idle deadline to lastRequest + the
+	// session's idle window.
+	fake := sp.(*fakeSpawn)
 	req := fakeEpoch.Add(30 * time.Minute)
 	if err := sp.KeepWarm(ctx, inst.ID, req); err != nil {
 		t.Fatalf("KeepWarm: %v", err)
 	}
-	got, _ = sp.Status(ctx, inst.ID)
-	if want := req.Add(defaultKeepWarmGrace); !got.IdleDeadline.Equal(want) {
-		t.Errorf("idle deadline = %v, want %v", got.IdleDeadline, want)
+	idle, ok := fake.IdleDeadline(inst.ID)
+	if !ok {
+		t.Fatal("no modeled idle deadline for the instance")
+	}
+	if want := req.Add(inst.IdleTimeout); !idle.Equal(want) {
+		t.Errorf("idle deadline = %v, want %v", idle, want)
 	}
 
 	if err := sp.Terminate(ctx, inst.ID); err != nil {

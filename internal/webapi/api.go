@@ -38,6 +38,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -407,18 +408,23 @@ func (d Deps) register(ctx context.Context, sid string) error {
 	if err != nil {
 		return err
 	}
+	url, err := workerURL(inst)
+	if err != nil {
+		return err
+	}
 	return d.Gateway.Store.Put(ctx, gateway.Session{
 		ID:         sid,
 		InstanceID: inst.ID,
-		WorkerURL:  workerURL(inst),
+		WorkerURL:  url,
 	})
 }
 
 // workerURL is where the session's worker accepts graphs (FastAPI on :8000).
-func workerURL(inst spore.Instance) string {
-	host := inst.PublicDNS
-	if host == "" {
-		host = inst.ID
+// A missing address is an error, not a fallback to the instance ID — see the
+// twin in cmd/foray for why that fallback hid a real bug.
+func workerURL(inst spore.Instance) (string, error) {
+	if inst.PublicIP == "" {
+		return "", fmt.Errorf("instance %s has no public address yet (state %q)", inst.ID, inst.State)
 	}
-	return "http://" + host + ":8000"
+	return "http://" + inst.PublicIP + ":8000", nil
 }

@@ -41,6 +41,7 @@ import (
 	"errors"
 	"fmt"
 	"os/exec"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -92,3 +93,13 @@ func joinCSV(xs []string) string { return strings.Join(xs, ",") }
 // durStr renders a duration the way the spore.host CLIs accept it (e.g. "8h",
 // "5m") — Go's Duration.String, which already emits that form.
 func durStr(d time.Duration) string { return d.String() }
+
+// joinPorts renders a port list as the comma-separated value spawn expects for
+// --active-ports (e.g. "8000" or "8000,8001").
+func joinPorts(ports []int) string {
+	parts := make([]string, 0, len(ports))
+	for _, p := range ports {
+		parts = append(parts, strconv.Itoa(p))
+	}
+	return strings.Join(parts, ",")
+}

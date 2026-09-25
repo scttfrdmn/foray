@@ -43,6 +43,16 @@ const (
 	DefaultIdleGrace = 5 * time.Minute
 )
 
+// workerPort is the port the nnsight worker's FastAPI server listens on
+// (worker/README.md). It is declared here rather than imported because brain
+// deliberately does not depend on internal/gateway; the URL-building twins in
+// cmd/foray and internal/webapi use the same number.
+//
+// It is passed to spawn as --active-ports so an in-flight trace registers as
+// activity with spawn's in-instance idle daemon — without it a long trace on a
+// quiet box reads as idle and the model-holding instance is reaped mid-request.
+const workerPort = 8000
+
 // Execute implements Executor: summon the rung's chosen instance and return the
 // spawn instance id as the session id. The gateway (forayd) maps the session to
 // this instance and bridges activity into spawn's idle signal.
@@ -64,6 +74,7 @@ func (e SpawnExecutor) Execute(ctx context.Context, q Question, r *Rung) (string
 		Spot:         e.Spot,
 		TTL:          ttl,
 		IdleGrace:    idle,
+		ActivePorts:  []int{workerPort},
 	})
 	if err != nil {
 		return "", fmt.Errorf("execute rung %d: %w", r.Index, err)
