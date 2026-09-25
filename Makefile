@@ -14,7 +14,13 @@ export AWS_PROFILE
 
 # Worker image (the one Python boundary, build step 5). Device is injected by the
 # control plane at run time, not baked in — cuda now, neuron the day TorchNeuron GAs.
-PYTHON       ?= python3
+#
+# Python is managed with uv: worker/pyproject.toml declares the deps and
+# worker/uv.lock pins them, so CI, the image and a laptop get the same resolution.
+# uv runs from the repo root with --project worker because the package imports as
+# `worker.*` (see worker/pyproject.toml).
+UV           ?= uv
+UV_PROJECT   ?= --project worker
 WORKER_IMAGE ?= foray-worker:dev
 WORKER_DEVICE ?= cuda
 
@@ -80,22 +86,38 @@ license-check:
 worker:
 	docker build -t $(WORKER_IMAGE) --build-arg FORAY_DEVICE=$(WORKER_DEVICE) -f worker/Dockerfile .
 
+## worker-sync: install the worker's base + dev deps from the lock (uv)
+.PHONY: worker-sync
+worker-sync:
+	$(UV) sync $(UV_PROJECT)
+
 ## worker-test: pytest the worker under FORAY_FAKE=1 (no GPU, no AWS) — CI gate
 .PHONY: worker-test
 worker-test:
 	@echo "==> worker-test: pytest with FORAY_FAKE=1 (no GPU, no AWS)"
-	FORAY_FAKE=1 $(PYTHON) -m pytest worker/tests -q
+	FORAY_FAKE=1 $(UV) run $(UV_PROJECT) python -m pytest worker/tests -q
+
+## worker-lint: ruff over the worker tree (uv)
+.PHONY: worker-lint
+worker-lint:
+	$(UV) run $(UV_PROJECT) ruff check worker
 
 ## worker-fake: run the worker locally in fake mode (uvicorn on :8000)
 .PHONY: worker-fake
 worker-fake:
-	FORAY_FAKE=1 $(PYTHON) -m uvicorn worker.app:app --host 127.0.0.1 --port 8000
+	FORAY_FAKE=1 $(UV) run $(UV_PROJECT) python -m uvicorn worker.app:app --host 127.0.0.1 --port 8000
+
+## worker-serve-fake: run the worker the way `spawn service` does — loopback + a
+## readiness line on stdout (#66). Useful for eyeballing the contract offline.
+.PHONY: worker-serve-fake
+worker-serve-fake:
+	FORAY_FAKE=1 $(UV) run $(UV_PROJECT) python -m worker.serve --addr 127.0.0.1:0
 
 ## worker-smoke: MANUAL real GPU/AWS smoke — never run in CI (see worker/README.md)
 .PHONY: worker-smoke
 worker-smoke:
 	@echo "==> worker-smoke: real GPU + AWS (gpt2 logit-lens -> S3). Not a CI target."
-	$(PYTHON) -m worker.smoke
+	$(UV) run $(UV_PROJECT) --extra gpu python -m worker.smoke
 
 TF_DIR    ?= deploy/terraform
 TF_VARS   ?= prod.tfvars

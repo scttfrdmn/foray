@@ -76,14 +76,19 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-python@v5
+      # uv manages the worker's Python (spore.host house convention; SHA-pinned so
+      # Dependabot bumps it deliberately).
+      - name: install uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
           python-version: "3.12"
-      # Base deps only — the GPU stack (torch/nnsight/vllm) is never installed in
-      # CI; the worker imports it lazily inside the real paths, which FORAY_FAKE=1
-      # never enters.
-      - run: pip install -r worker/requirements.txt
-      - run: ruff check worker
+      # --locked installs exactly worker/uv.lock and fails if the lock is stale, so
+      # a dependency change cannot land without its lock update. Base + dev deps
+      # only: the GPU stack (torch/nnsight/vllm) is the `gpu` extra and is never
+      # installed here — the worker imports it lazily inside the real paths, which
+      # FORAY_FAKE=1 never enters.
+      - run: uv sync --project worker --locked
+      - run: make worker-lint
       - run: make worker-test
 
   invariant:
