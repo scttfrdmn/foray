@@ -104,3 +104,54 @@ def test_default_session_id_when_env_absent(monkeypatch):
     r = client.post("/trace", json={"payload": _payload(prompt="x")})
     assert r.status_code == 200
     assert r.json()["session_id"]  # non-empty default
+
+
+class TestSessionToken:
+    """Token auth guards the tunnel (issue #66).
+
+    The worker binds loopback and is reached through spawn's ssh -L forward, so the
+    token is defense in depth rather than the only boundary — but anything that can
+    reach the loopback port (another process on the instance) must still present it.
+    """
+
+    @pytest.fixture
+    def tokened(self, monkeypatch):
+        monkeypatch.setenv("FORAY_FAKE", "1")
+        import worker.app as app_module
+
+        importlib.reload(app_module)
+        app_module.set_token("s3cret")
+        try:
+            yield TestClient(app_module.app)
+        finally:
+            # Leave the module unguarded for the other tests, which assume no token.
+            app_module.set_token(None)
+
+    def _body(self) -> dict:
+        return {"engine": "eager", "payload": _payload(prompt="hi", saves=["x"], layers=[0])}
+
+    def test_bearer_header_accepted(self, tokened) -> None:
+        r = tokened.post("/trace", json=self._body(), headers={"Authorization": "Bearer s3cret"})
+        assert r.status_code == 200, r.text
+
+    def test_query_param_accepted(self, tokened) -> None:
+        # The URL spawn prints for a human carries ?token=...; it should work.
+        r = tokened.post("/trace?token=s3cret", json=self._body())
+        assert r.status_code == 200, r.text
+
+    def test_missing_token_rejected(self, tokened) -> None:
+        r = tokened.post("/trace", json=self._body())
+        assert r.status_code == 401
+
+    def test_wrong_token_rejected(self, tokened) -> None:
+        r = tokened.post("/trace", json=self._body(), headers={"Authorization": "Bearer nope"})
+        assert r.status_code == 401
+
+    def test_healthz_needs_no_token(self, tokened) -> None:
+        # Liveness must not fail for want of a credential.
+        assert tokened.get("/healthz").status_code == 200
+
+    def test_no_token_configured_allows_plain_requests(self, client) -> None:
+        # make worker-fake / the tests run unguarded: an unguarded local dev server
+        # is not a boundary worth defending.
+        assert client.post("/trace", json=self._body()).status_code == 200
