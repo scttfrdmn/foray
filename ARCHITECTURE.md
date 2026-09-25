@@ -68,7 +68,16 @@ Every dollar above that is per-use (Bedrock tokens) or per-session (the GPU).
 | Stream weights S3 → HBM | GDS loader in the worker | once, on boot |
 | Scarce multi-GPU capacity wait | **lagotto** (spore.host) | as needed |
 | Saved activations | **S3, in-region** | until the user discards |
-| Self-terminate | spawn TTL + request-level idle | end of session |
+| Self-terminate | spawn **TTL** (idle only stops — see below) | end of session |
+
+**Idle stops; TTL terminates.** This distinction is worth stating plainly because
+it is easy to assume otherwise. spawn's idle daemon *stops* (or hibernates) an
+instance — it never terminates one, and `--on-idle` explicitly refuses
+`terminate`. A stopped instance costs no compute but **keeps billing its EBS
+volumes**, so "$0 when it's gone" is reached by **TTL**, not by idle. Idle is the
+fast brake, TTL is the guarantee. Anything that wants $0 sooner has to terminate
+deliberately — see issue #80, which tracks foray doing exactly that at
+end-of-session.
 
 The new code in all of this is small: **`forayd`** (the gateway) and the
 **worker image**. Everything else is reuse (spore.host suite, Bedrock,
@@ -120,7 +129,8 @@ intent ──▶ brain (AgentCore) ──▶ proposed experiment ──▶ [user
                                                                        ▼
                           viz rendered; only pixels reach the browser
                                                                        ▼
-                          idle (no requests N min) → spawn terminates → $0
+                          idle (no requests N min) → spawn stops the instance
+                                                    → TTL → terminate → $0
 ```
 
 The **plan/execute split with a human-in-the-loop seam** is the clAWS pattern:

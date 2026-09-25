@@ -11,6 +11,19 @@ prefix.
 
 ## [Unreleased]
 
+### Documentation
+
+- Corrected a claim that was simply false: **spawn's idle action stops an
+  instance, it never terminates one** (`--on-idle` explicitly refuses
+  `terminate`, and only TTL destroys an instance). ARCHITECTURE.md §2/§4, the
+  CLAUDE.md "ephemeral by default" invariant and the README all said idle
+  terminates and reached $0; a stopped instance costs no compute but **keeps
+  billing its EBS volumes**, so $0 arrives at TTL. Idle is the fast brake, TTL is
+  the guarantee. `foray stop`'s decline message said "idle + TTL will still reap
+  it", which promised a $0 that does not arrive until TTL. Issue #80 tracks the
+  behavior change (terminating deliberately at end-of-session); this is the
+  documentation half, correct regardless of which fix lands.
+
 ### Changed
 
 - The worker's Python is managed with **uv**. `worker/pyproject.toml` is now the

@@ -14,7 +14,8 @@ AWS account.*
 
 - **Ephemeral by default.** Nothing is kept warm. No hot/warm tiers, no
   scheduler, no resident catalog. An instance exists only while a session runs;
-  idle + TTL terminate it.
+  TTL terminates it. (spawn's idle action *stops* an instance, it never
+  terminates — so TTL is what actually reaches $0. See issue #80.)
 - **Control plane rests at ~$0.** Static SPA + cold Lambdas + Bedrock per-token.
   Never introduce an always-on server, queue broker, or Ray/K8s cluster.
 - **Cost is per-session, not per-hour.** Every surface shows $/session. The brain
@@ -116,4 +117,5 @@ with tests first.
 `make demo-fake` walks intent → proposed experiment (model+technique+hardware+$)
 → Go → fake spawn → trace → receipt, entirely offline. Then the same loop against
 a real account launches a G7/G7e instance, streams a small model, runs a logit
-lens, returns the viz and the generated `nnsight`, and self-terminates on idle.
+lens, returns the viz and the generated `nnsight`, and self-terminates on TTL
+(idle stops it first).
