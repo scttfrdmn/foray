@@ -5,14 +5,19 @@ open model, on right-sized EC2 GPUs, for the length of one experiment, in your
 own AWS account. Then it's gone.
 
 > [!NOTE]
-> **Status: early (v0.x, pre-release).** The AWS-free core is implemented and
-> green: `device`, `sizing`, and the `brain` ladder all build and test, and
-> **`make demo-fake` walks the full intent→plan→Go→run→assess→climb→receipt
-> loop offline** (the MVP definition of done). The AWS-touching pieces —
-> `catalog`, the real (non-fake) brain path, `forayd`, the worker, and deploy —
-> are not built yet; their work is tracked as issues and milestones (see
-> [Project status](#project-status)). The static web page (`web/index.html`)
-> runs the same loop client-side with canned data.
+> **Status: early (v0.x, pre-release).** The
+> [ARCHITECTURE.md §10 build order is complete](#project-status) — all nine
+> steps are on `main`, and **`make demo-fake` walks the full
+> intent→plan→Go→run→assess→climb→receipt loop offline** (the MVP definition of
+> done). The control plane has been deployed to a real account and torn down
+> clean, with live Bedrock planning, a DynamoDB session round-trip proving the
+> idle bridge fires, and a real presigned export.
+>
+> **The remaining gap is the GPU data plane end-to-end:** the gateway Lambda has
+> no network path to the worker yet
+> ([#66](https://github.com/scttfrdmn/foray/issues/66)), so a real trace against
+> a live GPU is not validated. The worker's real path is exercised by hand via
+> `make worker-smoke`, never in CI.
 
 [![CI](https://github.com/scttfrdmn/foray/actions/workflows/ci.yml/badge.svg)](https://github.com/scttfrdmn/foray/actions/workflows/ci.yml)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
@@ -65,27 +70,43 @@ cd foray
 make demo-fake             # intent -> plan -> Go -> run -> assess -> climb -> receipt
                            # entirely offline, zero AWS calls (the CI gate)
 
-# The static page runs the same loop client-side with canned data:
-open web/index.html        # or: python3 -m http.server -d web
+make web-fake              # the same loop in the browser, still offline:
+                           # serves web/ + the /api brain loop on localhost:8090
 ```
+
+The page is a thin client over the real brain loop (`POST /api/propose` →
+Go → `POST /api/approve`), so it needs that server — opening `web/index.html`
+straight from disk leaves it with no API to call.
 
 ## Project status
 
 Build order (see [ARCHITECTURE.md §10](ARCHITECTURE.md)). Each step is an issue
-milestone; earlier steps have no AWS dependency.
+milestone; earlier steps have no AWS dependency. **All nine steps are on `main`.**
 
 | Step | Component | State |
 | --- | --- | --- |
 | 0 | Bootstrap (repo, license, CI, layout) | ✅ done |
-| 1 | `device` + `sizing` | ✅ implemented + tested |
-| 2 | `catalog` | 🔲 tracked |
-| 3 | `spore` adapters (truffle / spawn / lagotto) | 🔲 tracked |
-| 4 | `forayd` gateway (the load-bearing contract) | 🔲 tracked |
-| 5 | `worker` (nnsight, Python) | 🔲 tracked |
-| 6 | `brain` (AgentCore + Cedar + HITL ladder) | 🟡 ladder + fake path green; real AgentCore/Cedar tracked |
-| 7 | `foray` CLI | 🟡 fake loop works; real path + expert flags tracked |
-| 8 | `web` static SPA | 🟡 skeleton + style contract |
-| 9 | `deploy` (IaC) | 🔲 tracked |
+| 1 | `device` + `sizing` | ✅ done |
+| 2 | `catalog` (hf / `s3://` / `upload:` resolver) | ✅ done |
+| 3 | `spore` adapters (truffle / spawn / lagotto) | ✅ done |
+| 4 | `forayd` gateway (the load-bearing contract) | ✅ done |
+| 5 | `worker` (nnsight, Python) | ✅ done — fake path in CI; real GPU by hand (`make worker-smoke`) |
+| 6 | `brain` (AgentCore + Cedar + HITL ladder) | ✅ done — live Bedrock verified |
+| 7 | `foray` CLI (run / export / models / sessions / stop) | ✅ done |
+| 8 | `web` static SPA | ✅ skeleton + live brain loop; polished UI deferred ([#28](https://github.com/scttfrdmn/foray/issues/28)) |
+| 9 | `deploy` (IaC) | ✅ done — real apply/destroy hand-validated |
+
+Since the build order closed: per-question cost receipts persisted to DynamoDB,
+`truffle` bundled into the web-API Lambda so the deployed control plane can
+price, and two invariants turned into build-failing CI gates — a static scan for
+always-on infra, and a reflective test that fails if any trace-result boundary
+struct grows a tensor-bearing field.
+
+**Known gap:** gateway→worker reachability in the deployed control plane
+([#66](https://github.com/scttfrdmn/foray/issues/66)) — VPC-attaching the Lambda
+to reach a private worker would add hourly-billing endpoints/NAT and break the
+~$0 control plane, so the fix has to preserve that invariant. Needs a real GPU to
+validate.
 
 Track everything in
 [Issues](https://github.com/scttfrdmn/foray/issues) and
@@ -95,12 +116,20 @@ Track everything in
 
 ```
 cmd/foray/              the CLI (run / export / models / sessions / stop)
+cmd/forayd/             the gateway daemon (also the Lambda entrypoint)
+cmd/foray-web/          dev server: the SPA + the /api brain loop
 internal/brain/         AgentCore plan/execute + the result-gated ladder
 internal/brain/policy/  foray.cedar — the policy spine
+internal/catalog/       model-source resolver (hf id / s3:// / upload:)
 internal/device/        accelerator/instance abstraction (NVIDIA now, neuron gated)
 internal/sizing/        footprint -> ranked hardware options
+internal/gateway/       forayd: graph routing + the spawn idle bridge
+internal/spore/         thin adapters over truffle / spawn / lagotto
+internal/webapi/        the HTTP surface the page talks to
 internal/export/        opt-in presigned download of your own saved values
+worker/                 the nnsight worker (the one Python boundary)
 web/                    the static SPA (S3 + CloudFront)
+deploy/terraform/       IaC for the ~$0 control plane
 ARCHITECTURE.md         the full design
 CLAUDE.md               the working contract / invariants
 ```

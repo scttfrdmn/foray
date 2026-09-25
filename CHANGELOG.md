@@ -11,6 +11,18 @@ prefix.
 
 ## [Unreleased]
 
+### Documentation
+
+- `README.md`: refreshed the project-status section, which still described steps
+  2–5 and 9 as unbuilt and 6–8 as partial. All nine build-order steps are on
+  `main`; the table now says so, notes the post-build-order work (cost receipts,
+  bundled truffle, the two invariant CI gates), and names the one real remaining
+  gap (#66 gateway→worker reachability). Also fixed a stale Quickstart: the page
+  is now a thin client over `/api`, so `open web/index.html` leaves it with no
+  API to call — `make web-fake` is the offline browser path. Repository-layout
+  block completed (it omitted `catalog`, `gateway`, `spore`, `webapi`, `worker`,
+  `deploy`, and both new `cmd/` entrypoints).
+
 ### Fixed
 
 - `internal/brain`: `extractJSON` now repairs literal control characters (raw
