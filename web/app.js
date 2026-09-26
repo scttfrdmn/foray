@@ -47,6 +47,43 @@ async function api(path, body) {
   return data;
 }
 
+/* ---- waiting for a handed-off trace (#66) ---- */
+//
+// Polling rather than a push: the worker runs on an instance with no inbound path, and
+// the control plane is cold Lambdas with nowhere to receive a callback — the result
+// appearing in the bucket IS the completion signal. The interval is a compromise: long
+// enough that a multi-minute trace costs a handful of requests, short enough that a fast
+// GPT-2 rung feels immediate. Elapsed seconds are shown because a spinner with no number
+// is indistinguishable from a hang.
+const POLL_MS = 3000;
+const POLL_TIMEOUT_MS = 20 * 60 * 1000; // weights stream, then the trace runs
+
+async function pollResult(started, rungIndex, note) {
+  const startedAt = Date.now();
+  for (;;) {
+    await new Promise((r) => setTimeout(r, POLL_MS));
+
+    // A worker that failed wrote the reason as its result, so api() throws with the
+    // worker's own message rather than this looping forever.
+    const out = await api("/api/result", {
+      ladder: started.ladder,
+      rungIndex: rungIndex,
+      sessionId: started.sessionId,
+    });
+    if (out.status === "done") return out;
+
+    const secs = Math.round((Date.now() - startedAt) / 1000);
+    note.textContent = "running on the GPU · " + secs + "s · session " + started.sessionId;
+
+    if (Date.now() - startedAt > POLL_TIMEOUT_MS) {
+      throw new Error(
+        "no result after " + Math.round(POLL_TIMEOUT_MS / 60000) + " minutes — " +
+        "check the session with `foray sessions`"
+      );
+    }
+  }
+}
+
 /* ---- probability colormap (inferno-ish), t in [0,1] ---- */
 const STOPS = ["#2A2250", "#7A2E83", "#C03A6E", "#F0852E", "#FBD08A"].map(hexRGB);
 function hexRGB(h) { return [1, 3, 5].map(i => parseInt(h.slice(i, i + 2), 16)); }
@@ -191,6 +228,9 @@ async function runRung(rung, li) {
   foot.textContent = rung.model + " · " + rung.layers + " layers · resolving …";
   const settle = renderStrata($(".strata", result), rung.layers, true);
 
+  // Approve launches and hands the graph to the instance; the trace finishes on the
+  // GPU, not inside the request (#66). So this returns `running` and we poll
+  // /api/result until the worker's result lands.
   let resp;
   try {
     resp = await api("/api/approve", { ladder: currentLadder, rungIndex: rung.index });
@@ -204,6 +244,23 @@ async function runRung(rung, li) {
 
   currentLadder = resp.ladder; // advance the carried state
   setMeter(resp.spentUSD);
+
+  if (resp.status === "running") {
+    note.textContent = "running on the GPU · session " + resp.sessionId;
+    try {
+      resp = await pollResult(resp, rung.index, note);
+    } catch (err) {
+      btn.removeAttribute("aria-busy");
+      // A trace that failed on the worker says why — it writes the reason as its
+      // result rather than simply never finishing.
+      note.textContent = "failed: " + err.message;
+      foot.textContent = rung.model + " · no result";
+      li.classList.add("denied");
+      return;
+    }
+    currentLadder = resp.ladder;
+    setMeter(resp.spentUSD);
+  }
 
   // Settle the illustration, then reveal the server's finding + recommendation.
   setTimeout(() => {

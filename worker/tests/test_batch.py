@@ -152,3 +152,64 @@ class TestMain:
         monkeypatch.setattr(batch, "write_result", no_write)
 
         assert batch.main([]) == batch.EXIT_FAILED
+
+
+class TestFetchGraphWaits:
+    """The graph's key contains the instance id, so the control plane can only write it
+    AFTER launching. Booting takes a minute or more, so the object is normally already
+    there — but giving up on the first miss would fail a session for being early."""
+
+    @staticmethod
+    def _client_error(code: str):
+        import botocore.exceptions
+
+        return botocore.exceptions.ClientError({"Error": {"Code": code}}, "GetObject")
+
+    def test_retries_until_the_graph_appears(self, settings, monkeypatch) -> None:
+        calls = {"n": 0}
+
+        class Client:
+            def get_object(self, **_kw):
+                calls["n"] += 1
+                if calls["n"] < 3:
+                    raise TestFetchGraphWaits._client_error("NoSuchKey")
+                return {"Body": _Body(envelope(prompt="hi"))}
+
+        monkeypatch.setattr(batch, "_s3", lambda _s: Client())
+        iv = batch.fetch_graph(settings, sleep=lambda _s: None)
+        assert iv.prompt == "hi"
+        assert calls["n"] == 3
+
+    def test_gives_up_with_a_clear_message(self, settings, monkeypatch) -> None:
+        class Client:
+            def get_object(self, **_kw):
+                raise TestFetchGraphWaits._client_error("NoSuchKey")
+
+        monkeypatch.setattr(batch, "_s3", lambda _s: Client())
+        monkeypatch.setattr(batch, "GRAPH_WAIT_SECONDS", 0)
+
+        with pytest.raises(graph.GraphError, match="never handed one over"):
+            batch.fetch_graph(settings, sleep=lambda _s: None)
+
+    def test_does_not_wait_on_a_permissions_error(self, settings, monkeypatch) -> None:
+        """AccessDenied will not fix itself; polling it for two minutes would only delay
+        a clear failure."""
+        import botocore.exceptions
+
+        class Client:
+            def get_object(self, **_kw):
+                raise TestFetchGraphWaits._client_error("AccessDenied")
+
+        monkeypatch.setattr(batch, "_s3", lambda _s: Client())
+        with pytest.raises(botocore.exceptions.ClientError):
+            batch.fetch_graph(settings, sleep=lambda _s: None)
+
+
+class _Body:
+    """Minimal stand-in for S3's streaming body."""
+
+    def __init__(self, data: bytes) -> None:
+        self._data = data
+
+    def read(self) -> bytes:
+        return self._data
