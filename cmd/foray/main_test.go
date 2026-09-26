@@ -18,7 +18,10 @@ import (
 	"context"
 	"errors"
 	"flag"
+	"io"
+	"strings"
 	"testing"
+	"testing/iotest"
 
 	"github.com/scttfrdmn/foray/internal/brain"
 	"github.com/scttfrdmn/foray/internal/gateway"
@@ -198,6 +201,46 @@ func TestParseWithPositionalsAcceptsFlagsAfterTheQuestion(t *testing.T) {
 			}
 			if *budget != tt.wantBudget {
 				t.Errorf("--budget = %v, want %v", *budget, tt.wantBudget)
+			}
+		})
+	}
+}
+
+// The Go gate must never read an absent human as an approving one. An unreadable
+// stdin returns io.EOF with an empty string — the same value a bare Enter gives —
+// so discarding the error made "nobody is there" mean "yes", and an unattended
+// `foray run` launched GPUs with no acceptance node (issue #87). CLAUDE.md:
+// "the human at Go is the acceptance node".
+func TestConfirmRefusesWhenStdinHasNothingToGive(t *testing.T) {
+	tests := []struct {
+		name  string
+		input io.Reader
+		want  bool
+	}{
+		// The money-spending case: no input available at all.
+		{"empty reader (closed stdin / no tty)", strings.NewReader(""), false},
+		{"eof-ing reader", iotest.ErrReader(io.EOF), false},
+		{"read error", iotest.ErrReader(errors.New("stdin broke")), false},
+
+		// A person at a terminal is unaffected: bare Enter still defaults to yes.
+		{"bare enter", strings.NewReader("\n"), true},
+		{"y", strings.NewReader("y\n"), true},
+		{"yes", strings.NewReader("yes\n"), true},
+		{"uppercase Y", strings.NewReader("Y\n"), true},
+		{"padded yes", strings.NewReader("  yes  \n"), true},
+
+		{"n", strings.NewReader("n\n"), false},
+		{"no", strings.NewReader("no\n"), false},
+		{"anything else", strings.NewReader("maybe\n"), false},
+
+		// A final line without a trailing newline still counts as an answer: the
+		// read errors with EOF, but it returned content, so a human did answer.
+		{"answer without trailing newline", strings.NewReader("y"), true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := confirmFrom(tt.input, "  Go?"); got != tt.want {
+				t.Errorf("confirmFrom = %v, want %v", got, tt.want)
 			}
 		})
 	}

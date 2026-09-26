@@ -49,6 +49,22 @@ prefix.
 
 ### Fixed
 
+- `cmd/foray`: **an unattended run no longer approves its own rungs** (#87). The
+  Go prompt read an unreadable stdin as approval: a closed pipe or absent tty
+  returns `io.EOF` with an empty string, which is the *same value* a bare Enter
+  produces, and the error was discarded — so "nobody is there" meant "yes".
+  `foray run "q" < /dev/null` with **no `--yes` at all** approved every rung and
+  launched a GPU per rung, with no human at the acceptance node. That is the
+  invariant CLAUDE.md calls load-bearing ("the human at Go is the acceptance
+  node"; "no GPU launches before approval"), so it is a refusal now: an absent
+  human is not an approving one, and the prompt says to pass `--yes` (or
+  `--force`) if pre-authorization was the intent. A person at a terminal is
+  unaffected — bare Enter still defaults to yes, because interactive Enter returns
+  `"\n"` with a nil error. `confirmFrom` takes an injectable reader so the
+  behavior is testable without a tty; the table covers EOF, a read error, and
+  every interactive answer, and was verified to fail with the guard made inert.
+  Same prompt backs `foray stop`, which gains the same protection.
+
 - `cmd/foray`: **flags written after the question no longer get silently dropped.**
   stdlib `flag` stops parsing at the first positional argument, so
   `foray run "why does it refuse X?" --yes` discarded `--yes` — which is how a

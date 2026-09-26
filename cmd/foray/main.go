@@ -30,6 +30,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -727,9 +728,30 @@ func printProposal(p *brain.Proposal) {
 	}
 }
 
-func confirm(prompt string) bool {
+// confirm asks a yes/no question on stdin, defaulting to yes on a bare Enter.
+//
+// It refuses when stdin has nothing to give. An unreadable stdin — a closed pipe,
+// no tty — returns io.EOF with an empty string, which is the *same value* a bare
+// Enter produces; discarding the error therefore made "nobody is there" mean
+// "yes". For the Go gate that meant an unattended `foray run` approved every rung
+// and launched GPUs with no human at the acceptance node, which is the invariant
+// CLAUDE.md calls load-bearing (issue #87). An absent human is not an approving
+// one, and this prompt spends money, so the safe direction is the only direction.
+//
+// Interactive Enter still returns "\n" with a nil error, so the [Y/n] default is
+// unchanged for a person at a terminal.
+func confirm(prompt string) bool { return confirmFrom(os.Stdin, prompt) }
+
+// confirmFrom is confirm over an injectable reader, so the refusal-on-EOF behavior
+// is testable without a terminal.
+func confirmFrom(r io.Reader, prompt string) bool {
 	fmt.Printf("%s [Y/n] ", prompt)
-	s, _ := bufio.NewReader(os.Stdin).ReadString('\n')
+	s, err := bufio.NewReader(r).ReadString('\n')
+	if err != nil && strings.TrimSpace(s) == "" {
+		fmt.Println("\n  no answer available on stdin — declining.")
+		fmt.Println("  pass --yes to pre-authorize a run, or --force to skip this prompt.")
+		return false
+	}
 	s = strings.TrimSpace(strings.ToLower(s))
 	return s == "" || s == "y" || s == "yes"
 }
