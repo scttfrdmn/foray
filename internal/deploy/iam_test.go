@@ -28,7 +28,8 @@ const testAccount = "123456789012"
 // The three roles and the instance profile are created, and the profile holds the
 // spawn role.
 func TestIAMRolesCreated(t *testing.T) {
-	d, _, _, iamc := newTestDeployer(t, testConfig())
+	d, f := newTestDeployer(t, testConfig())
+	iamc := f.iam
 	if _, err := d.Apply(context.Background()); err != nil {
 		t.Fatalf("Apply: %v", err)
 	}
@@ -55,7 +56,8 @@ func TestIAMRolesCreated(t *testing.T) {
 // those first. The fakes model both refusals, so this test would fail if the
 // ordering were wrong.
 func TestIAMTeardownStripsPoliciesAndProfileFirst(t *testing.T) {
-	d, _, _, iamc := newTestDeployer(t, testConfig())
+	d, f := newTestDeployer(t, testConfig())
+	iamc := f.iam
 	if _, err := d.Apply(context.Background()); err != nil {
 		t.Fatalf("Apply: %v", err)
 	}
@@ -78,7 +80,7 @@ func TestIAMTeardownStripsPoliciesAndProfileFirst(t *testing.T) {
 // deletion is refused. Asserted on the action order rather than the end state, so a
 // regression is caught even if a retry happened to paper over it.
 func TestInstanceProfileRemovedBeforeItsRole(t *testing.T) {
-	d, _, _, _ := newTestDeployer(t, testConfig())
+	d, _ := newTestDeployer(t, testConfig())
 	if _, err := d.Apply(context.Background()); err != nil {
 		t.Fatalf("Apply: %v", err)
 	}
@@ -107,7 +109,8 @@ func TestInstanceProfileRemovedBeforeItsRole(t *testing.T) {
 // off cleanly, because teardown enumerates what is actually attached rather than
 // assuming its own list.
 func TestIAMTeardownRemovesDriftedPolicies(t *testing.T) {
-	d, _, _, iamc := newTestDeployer(t, testConfig())
+	d, f := newTestDeployer(t, testConfig())
+	iamc := f.iam
 	if _, err := d.Apply(context.Background()); err != nil {
 		t.Fatalf("Apply: %v", err)
 	}
@@ -125,7 +128,8 @@ func TestIAMTeardownRemovesDriftedPolicies(t *testing.T) {
 // Re-applying converges rather than failing: AddRoleToInstanceProfile errors if the
 // profile already holds a role, so ensure must check first.
 func TestInstanceProfileReapplyDoesNotReAddRole(t *testing.T) {
-	d, _, _, iamc := newTestDeployer(t, testConfig())
+	d, f := newTestDeployer(t, testConfig())
+	iamc := f.iam
 	if _, err := d.Apply(context.Background()); err != nil {
 		t.Fatalf("first Apply: %v", err)
 	}
@@ -140,7 +144,8 @@ func TestInstanceProfileReapplyDoesNotReAddRole(t *testing.T) {
 // A drifted trust policy is a role nothing can assume, which fails at invoke time
 // rather than deploy time — so Apply converges it.
 func TestRoleTrustPolicyConverges(t *testing.T) {
-	d, _, _, iamc := newTestDeployer(t, testConfig())
+	d, f := newTestDeployer(t, testConfig())
+	iamc := f.iam
 	if _, err := d.Apply(context.Background()); err != nil {
 		t.Fatalf("Apply: %v", err)
 	}

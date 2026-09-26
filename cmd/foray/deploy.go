@@ -36,6 +36,10 @@ func deployCmd(ctx context.Context, args []string) {
 		dataBucket = fs.String("data-bucket", os.Getenv("FORAY_DATA_BUCKET"), "globally-unique S3 bucket for in-region saves (default $FORAY_DATA_BUCKET)")
 		table      = fs.String("table", deploy.DefaultSessionsTable, "DynamoDB table for sessions + cost receipts")
 		planModel  = fs.String("plan-model", envOr("FORAY_PLAN_MODEL", deploy.DefaultPlanModelID), "Bedrock inference profile the brain plans with (scopes the web API's IAM policy)")
+		gatewayZip = fs.String("gateway-zip", deploy.DefaultGatewayZip, "built forayd Lambda package (make lambdas)")
+		webAPIZip  = fs.String("webapi-zip", deploy.DefaultWebAPIZip, "built foray-web Lambda package (make lambdas)")
+		lwaLayer   = fs.String("lwa-layer-arn", "", "pin the Lambda Web Adapter layer ARN (default: resolve the newest published version for the region)")
+		logDays    = fs.Int("log-retention-days", deploy.DefaultLogRetentionDays, "CloudWatch log retention")
 		dryRun     = fs.Bool("dry-run", false, "print what would be created, call no mutating API")
 	)
 	_ = fs.Parse(args)
@@ -46,6 +50,11 @@ func deployCmd(ctx context.Context, args []string) {
 		DataBucket:    *dataBucket,
 		SessionsTable: *table,
 		PlanModelID:   *planModel,
+		GatewayZip:    *gatewayZip,
+		WebAPIZip:     *webAPIZip,
+		LWALayerARN:   *lwaLayer,
+		//nolint:gosec // retention days is a small positive int from a flag
+		LogRetentionDays: int32(*logDays),
 	})
 	if err != nil {
 		die(err)
@@ -57,7 +66,11 @@ func deployCmd(ctx context.Context, args []string) {
 		verb = "planning"
 	}
 	fmt.Printf("\n  %s the foray control plane in %s\n", verb, cfg.Region)
-	fmt.Printf("  web bucket: %s\n  data bucket: %s\n  sessions table: %s\n\n", cfg.WebBucket, cfg.DataBucket, cfg.SessionsTable)
+	fmt.Printf("  web bucket: %s\n  data bucket: %s\n  sessions table: %s\n", cfg.WebBucket, cfg.DataBucket, cfg.SessionsTable)
+	if cfg.LWALayerARN != "" {
+		fmt.Printf("  lambda web adapter: %s\n", cfg.LWALayerARN)
+	}
+	fmt.Println()
 
 	actions, err := d.Apply(ctx)
 	printActions(actions)

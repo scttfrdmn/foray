@@ -21,11 +21,16 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"net/url"
 	"sort"
+	"strings"
 
+	cwl "github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs"
+	cwltypes "github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs/types"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	ddbtypes "github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 	"github.com/aws/aws-sdk-go-v2/service/iam"
 	iamtypes "github.com/aws/aws-sdk-go-v2/service/iam/types"
+	"github.com/aws/aws-sdk-go-v2/service/lambda"
+	lambdatypes "github.com/aws/aws-sdk-go-v2/service/lambda/types"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 )
@@ -286,7 +291,9 @@ func NewFake(cfg Config) (*Deployer, error) {
 		// builds look like the real ones.
 		cfg.AccountID = "000000000000"
 	}
-	return newWith(cfg, newFakeDynamo(), newFakeS3(), newFakeIAM()), nil
+	// The rehearsal has no built zips, so hand the Lambdas canned bytes.
+	fakeZip := func(path string) ([]byte, error) { return []byte("fake-zip:" + path), nil }
+	return newWithZips(cfg, newFakeDynamo(), newFakeS3(), newFakeIAM(), newFakeLambda(), newFakeLogs(), fakeZip), nil
 }
 
 // --- IAM --------------------------------------------------------------------
@@ -518,4 +525,225 @@ func (f *fakeIAM) RemoveRoleFromInstanceProfile(_ context.Context, in *iam.Remov
 		delete(p.roles, aws.ToString(in.RoleName))
 	}
 	return &iam.RemoveRoleFromInstanceProfileOutput{}, nil
+}
+
+// --- Lambda -----------------------------------------------------------------
+
+type fakeFunction struct {
+	roleARN    string
+	codeSHA    string
+	layers     []string
+	env        map[string]string
+	timeout    int32
+	memoryMB   int32
+	arch       []lambdatypes.Architecture
+	runtime    lambdatypes.Runtime
+	tags       map[string]string
+	codeUpdate int // how many times the code was republished
+}
+
+type fakeLambda struct {
+	functions map[string]*fakeFunction
+	// layerVersions is what ListLayerVersions returns, newest first.
+	layerVersions []string
+	layerErr      error
+	// roleNotReady counts down the IAM-propagation window: while > 0, CreateFunction
+	// rejects the role the way Lambda does before IAM has propagated.
+	roleNotReady int
+	// createErr fails CreateFunction outright, for the "not a propagation error"
+	// path that must fail fast.
+	createErr error
+	creates   int
+}
+
+func newFakeLambda() *fakeLambda {
+	return &fakeLambda{
+		functions: map[string]*fakeFunction{},
+		// A plausible published version so resolution yields a real-shaped ARN.
+		layerVersions: []string{"25"},
+	}
+}
+
+func (f *fakeLambda) ListLayerVersions(_ context.Context, in *lambda.ListLayerVersionsInput, _ ...func(*lambda.Options)) (*lambda.ListLayerVersionsOutput, error) {
+	if f.layerErr != nil {
+		return nil, f.layerErr
+	}
+	base := aws.ToString(in.LayerName)
+	out := &lambda.ListLayerVersionsOutput{}
+	for _, v := range f.layerVersions {
+		out.LayerVersions = append(out.LayerVersions, lambdatypes.LayerVersionsListItem{
+			LayerVersionArn: aws.String(base + ":" + v),
+		})
+	}
+	return out, nil
+}
+
+func (f *fakeLambda) GetFunction(_ context.Context, in *lambda.GetFunctionInput, _ ...func(*lambda.Options)) (*lambda.GetFunctionOutput, error) {
+	name := aws.ToString(in.FunctionName)
+	fn, ok := f.functions[name]
+	if !ok {
+		return nil, &lambdatypes.ResourceNotFoundException{Message: aws.String("no such function")}
+	}
+	return &lambda.GetFunctionOutput{Configuration: &lambdatypes.FunctionConfiguration{
+		FunctionName: in.FunctionName,
+		FunctionArn:  aws.String("arn:aws:lambda:us-west-2:000000000000:function:" + name),
+		CodeSha256:   aws.String(fn.codeSHA),
+		Role:         aws.String(fn.roleARN),
+	}}, nil
+}
+
+func (f *fakeLambda) CreateFunction(_ context.Context, in *lambda.CreateFunctionInput, _ ...func(*lambda.Options)) (*lambda.CreateFunctionOutput, error) {
+	if f.createErr != nil {
+		return nil, f.createErr
+	}
+	if f.roleNotReady > 0 {
+		f.roleNotReady--
+		// Verbatim shape of the error Lambda returns before IAM has propagated.
+		return nil, &lambdatypes.InvalidParameterValueException{
+			Message: aws.String("The role defined for the function cannot be assumed by Lambda."),
+		}
+	}
+	name := aws.ToString(in.FunctionName)
+	if _, ok := f.functions[name]; ok {
+		return nil, &lambdatypes.ResourceConflictException{Message: aws.String("exists")}
+	}
+	f.creates++
+	env := map[string]string{}
+	if in.Environment != nil {
+		for k, v := range in.Environment.Variables {
+			env[k] = v
+		}
+	}
+	tags := map[string]string{}
+	for k, v := range in.Tags {
+		tags[k] = v
+	}
+	f.functions[name] = &fakeFunction{
+		roleARN:  aws.ToString(in.Role),
+		codeSHA:  zipSHA256(in.Code.ZipFile),
+		layers:   in.Layers,
+		env:      env,
+		timeout:  aws.ToInt32(in.Timeout),
+		memoryMB: aws.ToInt32(in.MemorySize),
+		arch:     in.Architectures,
+		runtime:  in.Runtime,
+		tags:     tags,
+	}
+	return &lambda.CreateFunctionOutput{}, nil
+}
+
+func (f *fakeLambda) DeleteFunction(_ context.Context, in *lambda.DeleteFunctionInput, _ ...func(*lambda.Options)) (*lambda.DeleteFunctionOutput, error) {
+	delete(f.functions, aws.ToString(in.FunctionName))
+	return &lambda.DeleteFunctionOutput{}, nil
+}
+
+func (f *fakeLambda) UpdateFunctionCode(_ context.Context, in *lambda.UpdateFunctionCodeInput, _ ...func(*lambda.Options)) (*lambda.UpdateFunctionCodeOutput, error) {
+	fn, ok := f.functions[aws.ToString(in.FunctionName)]
+	if !ok {
+		return nil, &lambdatypes.ResourceNotFoundException{}
+	}
+	fn.codeSHA = zipSHA256(in.ZipFile)
+	fn.codeUpdate++
+	return &lambda.UpdateFunctionCodeOutput{}, nil
+}
+
+func (f *fakeLambda) UpdateFunctionConfiguration(_ context.Context, in *lambda.UpdateFunctionConfigurationInput, _ ...func(*lambda.Options)) (*lambda.UpdateFunctionConfigurationOutput, error) {
+	fn, ok := f.functions[aws.ToString(in.FunctionName)]
+	if !ok {
+		return nil, &lambdatypes.ResourceNotFoundException{}
+	}
+	if in.Environment != nil {
+		fn.env = map[string]string{}
+		for k, v := range in.Environment.Variables {
+			fn.env[k] = v
+		}
+	}
+	if in.Layers != nil {
+		fn.layers = in.Layers
+	}
+	fn.timeout = aws.ToInt32(in.Timeout)
+	fn.memoryMB = aws.ToInt32(in.MemorySize)
+	return &lambda.UpdateFunctionConfigurationOutput{}, nil
+}
+
+func (f *fakeLambda) TagResource(_ context.Context, in *lambda.TagResourceInput, _ ...func(*lambda.Options)) (*lambda.TagResourceOutput, error) {
+	// Resource is an ARN; map it back to the function name's suffix.
+	arn := aws.ToString(in.Resource)
+	for name, fn := range f.functions {
+		if strings.HasSuffix(arn, ":"+name) {
+			for k, v := range in.Tags {
+				fn.tags[k] = v
+			}
+		}
+	}
+	return &lambda.TagResourceOutput{}, nil
+}
+
+// --- CloudWatch Logs --------------------------------------------------------
+
+type fakeLogGroup struct {
+	retentionDays int32
+	tags          map[string]string
+}
+
+type fakeLogs struct {
+	groups map[string]*fakeLogGroup
+	// tagErr makes tagging fail, so the best-effort path is exercised.
+	tagErr error
+}
+
+func newFakeLogs() *fakeLogs {
+	return &fakeLogs{groups: map[string]*fakeLogGroup{}}
+}
+
+func (f *fakeLogs) CreateLogGroup(_ context.Context, in *cwl.CreateLogGroupInput, _ ...func(*cwl.Options)) (*cwl.CreateLogGroupOutput, error) {
+	name := aws.ToString(in.LogGroupName)
+	if _, ok := f.groups[name]; ok {
+		return nil, &cwltypes.ResourceAlreadyExistsException{Message: aws.String("exists")}
+	}
+	tags := map[string]string{}
+	for k, v := range in.Tags {
+		tags[k] = v
+	}
+	f.groups[name] = &fakeLogGroup{tags: tags}
+	return &cwl.CreateLogGroupOutput{}, nil
+}
+
+func (f *fakeLogs) DeleteLogGroup(_ context.Context, in *cwl.DeleteLogGroupInput, _ ...func(*cwl.Options)) (*cwl.DeleteLogGroupOutput, error) {
+	delete(f.groups, aws.ToString(in.LogGroupName))
+	return &cwl.DeleteLogGroupOutput{}, nil
+}
+
+func (f *fakeLogs) PutRetentionPolicy(_ context.Context, in *cwl.PutRetentionPolicyInput, _ ...func(*cwl.Options)) (*cwl.PutRetentionPolicyOutput, error) {
+	g, ok := f.groups[aws.ToString(in.LogGroupName)]
+	if !ok {
+		return nil, &cwltypes.ResourceNotFoundException{}
+	}
+	g.retentionDays = aws.ToInt32(in.RetentionInDays)
+	return &cwl.PutRetentionPolicyOutput{}, nil
+}
+
+// DescribeLogGroups filters by PREFIX, as the real API does — which is why
+// logGroup.exists has to compare names exactly.
+func (f *fakeLogs) DescribeLogGroups(_ context.Context, in *cwl.DescribeLogGroupsInput, _ ...func(*cwl.Options)) (*cwl.DescribeLogGroupsOutput, error) {
+	prefix := aws.ToString(in.LogGroupNamePrefix)
+	out := &cwl.DescribeLogGroupsOutput{}
+	names := make([]string, 0, len(f.groups))
+	for n := range f.groups {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	for _, n := range names {
+		if prefix == "" || strings.HasPrefix(n, prefix) {
+			out.LogGroups = append(out.LogGroups, cwltypes.LogGroup{LogGroupName: aws.String(n)})
+		}
+	}
+	return out, nil
+}
+
+func (f *fakeLogs) TagResource(_ context.Context, in *cwl.TagResourceInput, _ ...func(*cwl.Options)) (*cwl.TagResourceOutput, error) {
+	if f.tagErr != nil {
+		return nil, f.tagErr
+	}
+	return &cwl.TagResourceOutput{}, nil
 }

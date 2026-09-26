@@ -19,8 +19,10 @@ import (
 	"fmt"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	cwl "github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/iam"
+	"github.com/aws/aws-sdk-go-v2/service/lambda"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/sts"
 )
@@ -40,10 +42,25 @@ func New(ctx context.Context, cfg Config, awsCfg aws.Config) (*Deployer, error) 
 		return nil, fmt.Errorf("resolve AWS account (check credentials): %w", err)
 	}
 	cfg.AccountID = aws.ToString(ident.Account)
+
+	lam := lambda.NewFromConfig(awsCfg)
+	// Resolve the LWA layer before anything is created, so an unresolvable layer
+	// fails a deploy that has not yet touched the account. A wrong layer is a silent
+	// 503 at invoke time, which is far more expensive to diagnose than an error here.
+	if cfg.LWALayerARN == "" {
+		arn, err := resolveLWALayerARN(ctx, lam, cfg.Region)
+		if err != nil {
+			return nil, err
+		}
+		cfg.LWALayerARN = arn
+	}
+
 	return newWith(cfg,
 		dynamodb.NewFromConfig(awsCfg),
 		s3.NewFromConfig(awsCfg),
 		iam.NewFromConfig(awsCfg),
+		lam,
+		cwl.NewFromConfig(awsCfg),
 	), nil
 }
 
@@ -62,8 +79,31 @@ func New(ctx context.Context, cfg Config, awsCfg aws.Config) (*Deployer, error) 
 // by reading the created resources, so ordering here is about what must exist
 // before something can be used — not about what must exist before a policy can be
 // written.
-func newWith(cfg Config, ddb dynamoAPI, s3c s3DeployAPI, iamc iamAPI) *Deployer {
+func newWith(cfg Config, ddb dynamoAPI, s3c s3DeployAPI, iamc iamAPI, lam lambdaAPI, logs logsAPI) *Deployer {
+	return newWithZips(cfg, ddb, s3c, iamc, lam, logs, nil)
+}
+
+// withZipReader installs a package loader, or leaves the default (os.ReadFile).
+func withZipReader(f *lambdaFunc, read func(string) ([]byte, error)) *lambdaFunc {
+	if read != nil {
+		f.readZip = read
+	}
+	return f
+}
+
+// newWithZips is newWith with an injectable deployment-package loader, so the
+// rehearsal and the tests do not need `make lambdas` to have run.
+func newWithZips(cfg Config, ddb dynamoAPI, s3c s3DeployAPI, iamc iamAPI, lam lambdaAPI, logs logsAPI, readZip func(string) ([]byte, error)) *Deployer {
 	tableARN := sessionsTableARN(cfg.Region, cfg.AccountID, cfg.SessionsTable)
+	logGroupFor := func(name string) *logGroup {
+		return &logGroup{
+			api:           logs,
+			group:         name,
+			retentionDays: cfg.LogRetentionDays,
+			region:        cfg.Region,
+			accountID:     cfg.AccountID,
+		}
+	}
 	return &Deployer{
 		cfg: cfg,
 		resources: []resource{
@@ -95,6 +135,15 @@ func newWith(cfg Config, ddb dynamoAPI, s3c s3DeployAPI, iamc iamAPI) *Deployer 
 			// Last of the IAM set, so Teardown removes it first: an instance profile
 			// holding a role blocks that role's deletion.
 			&instanceProfile{api: iamc, profileName: RoleSpawnInstance, roleName: RoleSpawnInstance},
+
+			// Log groups before their functions: created explicitly so retention is
+			// set from the start (a group Lambda creates implicitly retains forever)
+			// and so teardown has something to delete.
+			logGroupFor(lambdaLogGroup(FuncGateway)),
+			logGroupFor(lambdaLogGroup(FuncWebAPI)),
+			// The functions assume the IAM roles above, which is why they come after.
+			withZipReader(gatewayFunction(lam, cfg, cfg.LWALayerARN), readZip),
+			withZipReader(webAPIFunction(lam, cfg, cfg.LWALayerARN), readZip),
 		},
 	}
 }

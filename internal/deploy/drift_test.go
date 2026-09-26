@@ -152,3 +152,60 @@ func extractTerraformActions(tf string) []string {
 	}
 	return out
 }
+
+const lambdaTerraformPath = "../../deploy/terraform/lambda.tf"
+
+// The Lambda configuration must match the Terraform path too, and the per-function
+// AWS_LWA_PORT most of all: it is the value PR #64 got wrong, and getting it wrong
+// produces a silent 503 rather than a failed deploy. If one path is fixed and the
+// other is not, the bug comes back the next time someone deploys the other way.
+func TestLambdaConfigMatchesTerraform(t *testing.T) {
+	b, err := os.ReadFile(lambdaTerraformPath)
+	if err != nil {
+		t.Fatalf("read %s: %v", lambdaTerraformPath, err)
+	}
+	tf := string(b)
+
+	tests := []struct {
+		what string
+		want string
+	}{
+		{"gateway function name", FuncGateway},
+		{"web API function name", FuncWebAPI},
+		{"gateway LWA port", `"` + portGateway + `"`},
+		{"web API LWA port", `"` + portWebAPI + `"`},
+		{"LWA exec wrapper", lwaExecWrapper},
+		{"LWA readiness path", lwaReadinessURL},
+		{"provided runtime", "provided.al2023"},
+		{"arm64 architecture", "arm64"},
+		{"bundled-truffle PATH", "/var/task/bin"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.what, func(t *testing.T) {
+			if !strings.Contains(tf, tt.want) {
+				t.Errorf("%s (%q) is not in deploy/terraform/lambda.tf — the two paths have drifted", tt.what, tt.want)
+			}
+		})
+	}
+
+	// The two ports must differ in the .tf as well. A shared value there is the
+	// original bug.
+	if portGateway == portWebAPI {
+		t.Fatal("the two LWA ports are equal in Go")
+	}
+}
+
+// Log group names must match, or the two paths create different groups and a
+// teardown by one leaves the other's log storage billing.
+func TestLogGroupNamesMatchTerraform(t *testing.T) {
+	b, err := os.ReadFile(lambdaTerraformPath)
+	if err != nil {
+		t.Fatalf("read %s: %v", lambdaTerraformPath, err)
+	}
+	tf := string(b)
+	for _, g := range []string{lambdaLogGroup(FuncGateway), lambdaLogGroup(FuncWebAPI)} {
+		if !strings.Contains(tf, g) {
+			t.Errorf("log group %q is not in deploy/terraform/lambda.tf — a teardown by one path would orphan the other's", g)
+		}
+	}
+}
