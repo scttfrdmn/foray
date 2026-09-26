@@ -11,6 +11,29 @@ prefix.
 
 ## [Unreleased]
 
+### Fixed
+
+- `internal/deploy`: two bugs found hand-validating `foray deploy` against a real
+  account (#85) — the first deploy of the verb, and both were invisible offline.
+  - **The Lambda Web Adapter layer cannot be resolved with `ListLayerVersions`.**
+    Enumerating another account's layer is not permitted *even when the layer is
+    public*: the LWA layer's resource-based policy grants `lambda:GetLayerVersion`
+    to everyone and nothing else, so the call returns `AccessDenied` regardless of
+    the caller's own IAM. Resolution now searches with `GetLayerVersion` instead —
+    probe upward by doubling, then binary-search the boundary (~2·log₂(n) calls,
+    about ten for a layer at version 30). A subtlety that makes this work: an
+    *unpublished* version also answers `AccessDenied`, not `NotFound`, because the
+    resource policy is per-version — so "denied" and "absent" are the same answer
+    and are treated alike. Genuine errors (throttling, network) are still
+    propagated, since reading one as "absent" would silently resolve an older
+    version or none.
+  - **Log-group tagging used the wrong ARN form.** `TagResource` rejects a trailing
+    `:*` with `ValidationException: Invalid resourceArn` — that suffix is what IAM
+    *policies* use to match a group's streams. Impact was narrower than it looked:
+    newly created groups were tagged anyway (`CreateLogGroup` carries tags inline),
+    so what broke was the convergence path for a group that *already* existed —
+    precisely the implicitly-created, retains-forever group this code exists to fix.
+
 ### Added
 
 - **`foray deploy`: the HTTP API — routes, `$default` stage and Lambda invoke

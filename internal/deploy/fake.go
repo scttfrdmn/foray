@@ -549,9 +549,12 @@ type fakeFunction struct {
 
 type fakeLambda struct {
 	functions map[string]*fakeFunction
-	// layerVersions is what ListLayerVersions returns, newest first.
-	layerVersions []string
-	layerErr      error
+	// latestLayerVersion is the newest published version; anything above it answers
+	// AccessDenied, as the real public layer does.
+	latestLayerVersion int32
+	layerErr           error
+	// layerProbes counts GetLayerVersion calls, so the search's cost is observable.
+	layerProbes int
 	// roleNotReady counts down the IAM-propagation window: while > 0, CreateFunction
 	// rejects the role the way Lambda does before IAM has propagated.
 	roleNotReady int
@@ -564,24 +567,36 @@ type fakeLambda struct {
 func newFakeLambda() *fakeLambda {
 	return &fakeLambda{
 		functions: map[string]*fakeFunction{},
-		// A plausible published version so resolution yields a real-shaped ARN.
-		layerVersions: []string{"25"},
+		// Matches what the public arm64 layer was at in us-west-2 when this was
+		// validated against a real account.
+		latestLayerVersion: 30,
 	}
 }
 
-func (f *fakeLambda) ListLayerVersions(_ context.Context, in *lambda.ListLayerVersionsInput, _ ...func(*lambda.Options)) (*lambda.ListLayerVersionsOutput, error) {
+// GetLayerVersion models the public layer's behavior: versions 1..latestLayerVersion
+// are attachable, and anything beyond answers AccessDenied — NOT NotFound — because
+// the resource policy is per-version and an unpublished version has none.
+func (f *fakeLambda) GetLayerVersion(_ context.Context, in *lambda.GetLayerVersionInput, _ ...func(*lambda.Options)) (*lambda.GetLayerVersionOutput, error) {
 	if f.layerErr != nil {
 		return nil, f.layerErr
 	}
-	base := aws.ToString(in.LayerName)
-	out := &lambda.ListLayerVersionsOutput{}
-	for _, v := range f.layerVersions {
-		out.LayerVersions = append(out.LayerVersions, lambdatypes.LayerVersionsListItem{
-			LayerVersionArn: aws.String(base + ":" + v),
-		})
+	f.layerProbes++
+	v := int32(aws.ToInt64(in.VersionNumber))
+	if v < 1 || v > f.latestLayerVersion {
+		return nil, &fakeAccessDenied{}
 	}
-	return out, nil
+	return &lambda.GetLayerVersionOutput{
+		LayerVersionArn: aws.String(aws.ToString(in.LayerName) + fmt.Sprintf(":%d", v)),
+		Version:         int64(v),
+	}, nil
 }
+
+// fakeAccessDenied mimics Lambda's AccessDeniedException, which the SDK does not
+// model as a service-specific type.
+type fakeAccessDenied struct{}
+
+func (fakeAccessDenied) Error() string     { return "api error AccessDeniedException: not authorized" }
+func (fakeAccessDenied) ErrorCode() string { return "AccessDeniedException" }
 
 func (f *fakeLambda) GetFunction(_ context.Context, in *lambda.GetFunctionInput, _ ...func(*lambda.Options)) (*lambda.GetFunctionOutput, error) {
 	name := aws.ToString(in.FunctionName)

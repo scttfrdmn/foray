@@ -148,10 +148,16 @@ func (g *logGroup) exists(ctx context.Context) (bool, error) {
 	return false, nil
 }
 
-// logGroupARN is only needed for tagging; the trailing :* is the form the Logs API
-// expects for a log-group resource ARN.
+// logGroupARN is the ARN TagResource takes.
+//
+// No trailing ":*". That suffix is the form IAM *policies* use to match a log
+// group's streams, and passing it to TagResource is rejected with
+// `ValidationException: Invalid resourceArn` — which the first version of this file
+// did, discovered only on a real deploy. New groups were still tagged (CreateLogGroup
+// carries them inline); what broke was the convergence path for a group that already
+// existed, which is exactly the implicitly-created group this code exists to fix.
 func logGroupARN(g *logGroup) string {
-	return fmt.Sprintf("arn:%s:logs:%s:%s:log-group:%s:*", partition, g.region, g.accountID, g.group)
+	return fmt.Sprintf("arn:%s:logs:%s:%s:log-group:%s", partition, g.region, g.accountID, g.group)
 }
 
 // lambdaLogGroup is the conventional name Lambda itself would use, so creating it

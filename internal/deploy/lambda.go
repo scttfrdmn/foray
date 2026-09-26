@@ -31,7 +31,7 @@ import (
 
 // lambdaAPI is the slice of Lambda this package uses.
 type lambdaAPI interface {
-	layerLister
+	layerProbe
 	GetFunction(ctx context.Context, in *lambda.GetFunctionInput, opts ...func(*lambda.Options)) (*lambda.GetFunctionOutput, error)
 	CreateFunction(ctx context.Context, in *lambda.CreateFunctionInput, opts ...func(*lambda.Options)) (*lambda.CreateFunctionOutput, error)
 	DeleteFunction(ctx context.Context, in *lambda.DeleteFunctionInput, opts ...func(*lambda.Options)) (*lambda.DeleteFunctionOutput, error)
