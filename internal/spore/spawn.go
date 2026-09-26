@@ -66,6 +66,14 @@ type LaunchSpec struct {
 	TTL          time.Duration // hard auto-terminate ceiling (--ttl)
 	IdleGrace    time.Duration // idle-timeout: short post-trace warmth (--idle-timeout)
 
+	// Command runs on the instance after spored setup (--command). The deployed
+	// control plane uses it for launch-time handoff (issue #66): the worker is started
+	// with `python3 -m worker.batch`, reads the graph the gateway already wrote to the
+	// session's bucket prefix, writes back a result reference, and exits — so nothing
+	// has to reach the instance. Empty leaves the instance idle for the CLI's
+	// `spawn service` tunnel to drive instead.
+	Command string
+
 	// ActivePorts are TCP ports whose ESTABLISHED connections spawn's in-instance
 	// idle daemon counts as activity (--active-ports). This is the idle bridge's
 	// real mechanism: with the worker's port listed, a trace in flight resets the
@@ -183,6 +191,9 @@ func (s spawnAdapter) Launch(ctx context.Context, spec LaunchSpec) (Instance, er
 	}
 	if len(spec.ActivePorts) > 0 {
 		args = append(args, "--active-ports", joinPorts(spec.ActivePorts))
+	}
+	if spec.Command != "" {
+		args = append(args, "--command", spec.Command)
 	}
 	out, err := s.run.Run(ctx, "spawn", args...)
 	if err != nil {
