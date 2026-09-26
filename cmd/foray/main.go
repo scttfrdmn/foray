@@ -68,6 +68,10 @@ func main() {
 		sessionsCmd(ctx, os.Args[2:])
 	case "stop":
 		stopCmd(ctx, os.Args[2:])
+	case "deploy":
+		deployCmd(ctx, os.Args[2:])
+	case "teardown":
+		teardownCmd(ctx, os.Args[2:])
 	case "-h", "--help", "help":
 		usage()
 	default:
@@ -768,6 +772,8 @@ usage:
   foray run "<question>"          propose a ladder, approve, run, climb rung by rung
   foray run --model ... ...       expert path: skip the dialog, name every knob
   foray export <session>          download your own saved activations/outputs
+  foray deploy                    provision the ~$0 control plane (primary path)
+  foray teardown                  remove it — leave nothing billing
   foray models [<source>]         resolvable model sources (or resolve one)
   foray sessions                  running sessions: age, TTL, $-so-far
   foray stop <session>            stop a session (or let idle reap it)

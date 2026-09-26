@@ -64,7 +64,44 @@ if [ -d "$scan_root" ]; then
   done < <(find "$scan_root" -type f -name '*.tf')
 fi
 
+# --- the Go deploy path (issue #85) ------------------------------------------
+#
+# `foray deploy` provisions the control plane through the AWS SDK, which makes the
+# Terraform scan above only half the gate: an always-on resource created in Go
+# would be invisible to it. Scan internal/deploy/ for the SDK equivalents of the
+# resource types denied in the IaC, and assert the same DynamoDB billing rule.
+go_scan="internal/deploy"
+if [ -d "$go_scan" ]; then
+  # Service clients whose whole purpose is a resource that bills by the hour.
+  deny_go_import='aws-sdk-go-v2/service/(ecs|eks|rds|elasticache|elasticloadbalancing|elasticloadbalancingv2|mq|kafka|redshift|emr|kinesis|memorydb|opensearch|neptune|docdb)'
+  if hits=$(grep -rnE "$deny_go_import" "$go_scan" 2>/dev/null); then
+    echo "invariant #31 violation: always-on AWS service client in $go_scan:"
+    echo "$hits" | sed 's/^/  /'
+    echo "  (control plane must rest at ~\$0 — the deploy verb must not create"
+    echo "   hourly-billing infrastructure)"
+    fail=1
+  fi
+  # Calls that create an always-on resource even from an otherwise-allowed client
+  # (ec2 is allowed: spawn launches the GPU at runtime, but the CONTROL PLANE must
+  # never create an instance or a NAT gateway).
+  deny_go_call='(RunInstances|CreateNatGateway|CreateDBInstance|CreateDBCluster|CreateCacheCluster|CreateLoadBalancer|CreateAutoScalingGroup|CreateLaunchTemplate)\('
+  if hits=$(grep -rnE "$deny_go_call" "$go_scan" 2>/dev/null); then
+    echo "invariant #31 violation: always-on resource creation in $go_scan:"
+    echo "$hits" | sed 's/^/  /'
+    fail=1
+  fi
+  # A table created here must be on-demand, the same rule the .tf files carry.
+  if grep -rnE '\bCreateTable\(' "$go_scan" >/dev/null 2>&1; then
+    if ! grep -rnE 'BillingMode:[[:space:]]*ddbtypes\.BillingModePayPerRequest' "$go_scan" >/dev/null 2>&1; then
+      echo "invariant #31 violation: $go_scan calls CreateTable without"
+      echo "  BillingMode: ddbtypes.BillingModePayPerRequest (provisioned capacity"
+      echo "  is always-on billing)"
+      fail=1
+    fi
+  fi
+fi
+
 if [ "$fail" -eq 0 ]; then
-  echo "invariant-check: OK (no always-on server/broker/cluster in go.mod or $scan_root)"
+  echo "invariant-check: OK (no always-on server/broker/cluster in go.mod, $scan_root, or $go_scan)"
 fi
 exit "$fail"
