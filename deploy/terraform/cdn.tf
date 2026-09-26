@@ -89,16 +89,17 @@ resource "aws_cloudfront_distribution" "web" {
 
   # SPA routing: a deep link 403/404 from S3 returns index.html so the client
   # router takes over.
-  custom_error_response {
-    error_code         = 403
-    response_code      = 200
-    response_page_path = "/index.html"
-  }
-  custom_error_response {
-    error_code         = 404
-    response_code      = 200
-    response_page_path = "/index.html"
-  }
+  # Deliberately NO custom_error_response blocks.
+  #
+  # Rewriting 403/404 to index.html is the obvious SPA move and it is wrong here:
+  # CloudFront applies custom error responses across the WHOLE distribution, not per
+  # behavior, so they rewrite errors from the API origin too. Found on a real deploy —
+  # `POST /sessions/<unknown>/trace` returned 200 with the page's HTML instead of
+  # forayd's 404 JSON. The severe case is 403: a Cedar denial would become a 200 HTML
+  # page, so the policy reason would never reach the user.
+  #
+  # web/app.js has no client-side routing, so nothing needs this. If routing is added,
+  # use a CloudFront Function on the default behavior only.
 
   restrictions {
     geo_restriction { restriction_type = "none" }

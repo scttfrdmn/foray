@@ -19,6 +19,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 )
 
 func testConfig() Config {
@@ -32,8 +33,8 @@ func testConfig() Config {
 
 // resourceCount is how many resources a full Apply touches: the sessions table, two
 // buckets, three IAM roles, the spawn instance profile, three log groups, two Lambda
-// functions and the HTTP API.
-const resourceCount = 13
+// functions, the HTTP API, the CDN and the SPA upload.
+const resourceCount = 15
 
 // testFakes bundles the stand-ins so tests can reach whichever they assert on.
 type testFakes struct {
@@ -43,6 +44,7 @@ type testFakes struct {
 	lam   *fakeLambda
 	logs  *fakeLogs
 	apigw *fakeAPIGW
+	cf    *fakeCloudFront
 }
 
 // newTestDeployer builds the real resource list over fakes.
@@ -55,13 +57,25 @@ func newTestDeployer(t *testing.T, cfg Config) (*Deployer, *testFakes) {
 		lam:   newFakeLambda(),
 		logs:  newFakeLogs(),
 		apigw: newFakeAPIGW(),
+		cf:    newFakeCloudFront(),
 	}
 	cfg = mustValidate(t, cfg)
 	if cfg.LWALayerARN == "" {
 		cfg.LWALayerARN = lwaLayerBase(cfg.Region) + ":25"
 	}
 	zip := func(path string) ([]byte, error) { return []byte("zip:" + path), nil }
-	d := newWithZips(cfg, f.ddb, f.s3, f.iam, f.lam, f.logs, f.apigw, zip)
+	d := newWithZips(cfg, f.ddb, f.s3, f.iam, f.lam, f.logs, f.apigw, f.cf, zip)
+	// No web/ tree on disk in a unit test, and no sitting through a modeled
+	// CloudFront propagation.
+	for _, r := range d.resources {
+		switch res := r.(type) {
+		case *webSync:
+			res.readDir = func(string) ([]string, error) { return []string{"index.html", "app.js"}, nil }
+			res.readFile = func(p string) ([]byte, error) { return []byte("content:" + p), nil }
+		case *distribution:
+			res.sleep = func(time.Duration) {}
+		}
+	}
 	return d, f
 }
 
@@ -178,6 +192,15 @@ func TestTeardownRemovesEverythingAndIsIdempotent(t *testing.T) {
 		t.Fatalf("Teardown: %v", err)
 	}
 	for _, a := range first {
+		// The SPA upload has no lifecycle of its own: its objects are deleted with the
+		// bucket, so it reports absent rather than duplicating that work and inflating
+		// the count.
+		if a.Kind == "web sync" {
+			if a.Op != OpAbsent {
+				t.Errorf("Teardown: web sync → %s, want absent (the bucket removes its objects)", a.Op)
+			}
+			continue
+		}
 		if a.Op != OpDelete {
 			t.Errorf("Teardown: %s %s → %s, want delete", a.Kind, a.Name, a.Op)
 		}
@@ -197,6 +220,12 @@ func TestTeardownRemovesEverythingAndIsIdempotent(t *testing.T) {
 		if a.Op != OpAbsent {
 			t.Errorf("second Teardown: %s %s → %s, want absent", a.Kind, a.Name, a.Op)
 		}
+	}
+	if len(f.cf.dists) != 0 {
+		t.Errorf("%d distribution(s) left after teardown", len(f.cf.dists))
+	}
+	if len(f.cf.oacs) != 0 {
+		t.Errorf("%d origin access control(s) left after teardown", len(f.cf.oacs))
 	}
 }
 

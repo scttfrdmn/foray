@@ -110,6 +110,9 @@ type Config struct {
 	// LogRetentionDays bounds log storage, the one thing here that bills by the
 	// GB-month with no TTL of its own.
 	LogRetentionDays int32
+
+	// WebDir holds the static SPA to publish. Empty → DefaultWebDir.
+	WebDir string
 }
 
 // Defaults mirroring deploy/terraform/variables.tf and the Makefile's build paths.
@@ -148,6 +151,9 @@ func (c *Config) Validate() error {
 	}
 	if c.WebAPIZip == "" {
 		c.WebAPIZip = DefaultWebAPIZip
+	}
+	if c.WebDir == "" {
+		c.WebDir = DefaultWebDir
 	}
 	var missing []string
 	if strings.TrimSpace(c.Region) == "" {
@@ -223,6 +229,11 @@ type Deployer struct {
 	resources []resource
 	// DryRun reports what Apply would do without calling a mutating API.
 	DryRun bool
+	// NoWait returns from Apply without waiting for CloudFront to propagate to every
+	// edge, which takes minutes. Teardown ignores it — deleting a distribution
+	// *requires* the disabled state to have propagated, so skipping the wait there
+	// would not be faster, it would fail.
+	NoWait bool
 }
 
 // Config returns the validated configuration.
@@ -242,6 +253,9 @@ func (d *Deployer) Apply(ctx context.Context) ([]Action, error) {
 		if d.DryRun {
 			out = append(out, Action{Kind: r.kind(), Name: r.name(), Op: OpPlan})
 			continue
+		}
+		if w, ok := r.(interface{ setNoWait(bool) }); ok {
+			w.setNoWait(d.NoWait)
 		}
 		a, err := r.ensure(ctx)
 		if err != nil {

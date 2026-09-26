@@ -20,6 +20,8 @@ github.com/aws/aws-sdk-go-v2/service/apigatewayv2 v1.44.0 h1:+PUmMN8TCOMwE5sk/fb
 github.com/aws/aws-sdk-go-v2/service/apigatewayv2 v1.44.0/go.mod h1:gy2IdCAIthzCjcS6WsPsW2GD+64llLAC3d3XOIH8p7g=
 github.com/aws/aws-sdk-go-v2/service/bedrockruntime v1.63.0 h1:0YDtf7baintcPG68AG0sMdAVoV1Iej6eXIBh38sd1m4=
 github.com/aws/aws-sdk-go-v2/service/bedrockruntime v1.63.0/go.mod h1:7P+JIqwRqUIlzGn7Ba0qbSbPV/zsdZk7VkJTEFO6Z3U=
+github.com/aws/aws-sdk-go-v2/service/cloudfront v1.73.1 h1:/U9s1rmIvfAzSP9kg3k9CIB9wYM1l8ukje/+tx1J7yk=
+github.com/aws/aws-sdk-go-v2/service/cloudfront v1.73.1/go.mod h1:LTDZxT77siIgcH1AsJLiEmNkwycK4V0pmbwk8UUqdDc=
 github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs v1.88.1 h1:+pie8Q5EQoy2FvLb9zeoWabVC+Pfzyba4wwm7jgKyLc=
 github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs v1.88.1/go.mod h1:exErhqgSxrpHC1W1zKuAPcol+xft1vq6/HNmq2xBA4o=
 github.com/aws/aws-sdk-go-v2/service/dynamodb v1.59.2 h1:Rk2vMAylCpfUapcjnDLApIyzBBqANEyTiN54VktI07Y=
