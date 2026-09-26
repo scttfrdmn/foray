@@ -46,9 +46,18 @@ import base64
 import binascii
 import json
 import sys
+import time
 from dataclasses import asdict
 
 from . import config, device, engine, graph
+
+# The graph is written after the instance is launched, because its key contains the
+# instance id — which does not exist until then. The instance takes a minute or more to
+# boot, so the object is almost always there first; waiting closes the race rather than
+# betting on it, and a worker that gave up immediately would fail a session for being
+# early.
+GRAPH_WAIT_SECONDS = 120
+GRAPH_POLL_SECONDS = 2
 
 # Exit codes. The instance is terminated either way, so these are for a human reading
 # the console log — the authoritative outcome is result.json.
@@ -71,17 +80,42 @@ def _s3(settings):
     return boto3.client("s3", region_name=settings.save_region)
 
 
-def fetch_graph(settings) -> graph.Intervention:
-    """Read the handed-over graph and parse it into an Intervention.
+def fetch_graph(settings, *, sleep=None) -> graph.Intervention:
+    """Wait for the handed-over graph, then parse it into an Intervention.
 
     The envelope is what internal/gateway writes: {"engine": str, "payload": base64}.
     `payload` is base64 because Go marshals []byte that way — the same encoding the
     HTTP path uses, so graph.parse is reached identically either way.
+
+    It polls because of an ordering fact, not an S3 one: the graph's key contains the
+    instance id, so the control plane can only write it *after* launching the instance.
+    Booting takes a minute or more, so in practice the object is already there — but
+    giving up on the first miss would fail a session for the worker being early.
     """
-    body = _s3(settings).get_object(
-        Bucket=settings.save_bucket, Key=graph_key(settings.session_id)
-    )["Body"].read()
-    return parse_envelope(body, settings)
+    import botocore.exceptions  # noqa: PLC0415
+
+    naptime = sleep or time.sleep
+    client = _s3(settings)
+    key = graph_key(settings.session_id)
+    deadline = time.monotonic() + GRAPH_WAIT_SECONDS
+
+    while True:
+        try:
+            body = client.get_object(Bucket=settings.save_bucket, Key=key)["Body"].read()
+            return parse_envelope(body, settings)
+        except botocore.exceptions.ClientError as exc:
+            # Only "not there yet" is worth waiting on. A permissions or bucket problem
+            # will not fix itself, and polling it for two minutes would just delay a
+            # clear failure.
+            code = exc.response.get("Error", {}).get("Code", "")
+            if code not in ("NoSuchKey", "404", "NotFound"):
+                raise
+            if time.monotonic() >= deadline:
+                raise graph.GraphError(
+                    f"no graph at s3://{settings.save_bucket}/{key} after "
+                    f"{GRAPH_WAIT_SECONDS}s — the control plane never handed one over"
+                ) from exc
+            naptime(GRAPH_POLL_SECONDS)
 
 
 def parse_envelope(body: bytes, settings) -> graph.Intervention:

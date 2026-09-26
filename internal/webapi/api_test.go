@@ -109,9 +109,53 @@ func TestProposeBadBody(t *testing.T) {
 	}
 }
 
-// The full result-gated loop over HTTP: propose → approve rung 0 (launch, trace,
-// interpret, assess) → climb recommendation + a fresh next proposal → approve
-// rung 1 → stop, no next. Mirrors the CLI's runLoop and make demo-fake.
+// runRung does what the page does: approve (Cedar gate + launch + handoff) returns
+// `running`, then /api/result is polled until the worker's result lands and the rung is
+// interpreted and assessed (#66).
+//
+// The fake handoff reports pending once before answering, so this genuinely polls rather
+// than reading a result that was there all along.
+func runRung(t *testing.T, base string, ladder *brain.Ladder, rungIndex int) approveResp {
+	t.Helper()
+
+	var started approveResp
+	resp := postJSON(t, base+"/api/approve", approveReq{Ladder: ladder, RungIndex: rungIndex}, &started)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("approve rung %d status = %d, want 200", rungIndex, resp.StatusCode)
+	}
+	if started.Status != StatusRunning {
+		t.Fatalf("approve rung %d status = %q, want %q — the trace cannot finish inside one request",
+			rungIndex, started.Status, StatusRunning)
+	}
+	if started.SessionID == "" {
+		t.Fatalf("approve rung %d: no session id — nothing launched", rungIndex)
+	}
+	if started.Result != nil {
+		t.Errorf("approve rung %d returned a result while still running: %+v", rungIndex, started.Result)
+	}
+
+	const maxPolls = 10
+	for i := 0; i < maxPolls; i++ {
+		var out approveResp
+		resp := postJSON(t, base+"/api/result",
+			resultReq{Ladder: started.Ladder, RungIndex: rungIndex, SessionID: started.SessionID}, &out)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("result rung %d status = %d, want 200", rungIndex, resp.StatusCode)
+		}
+		if out.Status == StatusDone {
+			return out
+		}
+		if i == 0 && out.Status != StatusRunning {
+			t.Fatalf("first poll status = %q, want %q", out.Status, StatusRunning)
+		}
+	}
+	t.Fatalf("rung %d never finished after %d polls", rungIndex, maxPolls)
+	return approveResp{}
+}
+
+// The full result-gated loop over HTTP: propose → approve rung 0 (launch + handoff) →
+// poll to done (interpret, assess) → climb recommendation + a fresh next proposal →
+// approve rung 1 → stop, no next. Mirrors the CLI's runLoop and make demo-fake.
 func TestApproveWalksTheLadder(t *testing.T) {
 	srv := newTestServer(t)
 
@@ -119,18 +163,11 @@ func TestApproveWalksTheLadder(t *testing.T) {
 	postJSON(t, srv.URL+"/api/propose", proposeReq{Question: "why does it store France as Paris?"}, &planned)
 
 	// Rung 0: the cheap GPT-2 rung shows the effect; the brain recommends climbing.
-	var r0 approveResp
-	resp := postJSON(t, srv.URL+"/api/approve", approveReq{Ladder: planned.Ladder, RungIndex: 0}, &r0)
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("approve rung 0 status = %d, want 200", resp.StatusCode)
-	}
-	if r0.SessionID == "" {
-		t.Error("approve rung 0: no session id — nothing launched")
-	}
+	r0 := runRung(t, srv.URL, planned.Ladder, 0)
 	if r0.Result == nil || r0.Result.Finding == "" {
 		t.Fatalf("approve rung 0 result = %+v, want a finding", r0.Result)
 	}
-	if r0.Recommendation.Decision != string(brain.Climb) {
+	if r0.Recommendation == nil || r0.Recommendation.Decision != string(brain.Climb) {
 		t.Errorf("rung 0 decision = %q, want climb", r0.Recommendation.Decision)
 	}
 	if r0.NextProposal == nil || r0.NextProposal.Index != 1 {
@@ -141,12 +178,8 @@ func TestApproveWalksTheLadder(t *testing.T) {
 	}
 
 	// Rung 1: climb on a FRESH approve (never auto). The carried ladder advanced.
-	var r1 approveResp
-	resp = postJSON(t, srv.URL+"/api/approve", approveReq{Ladder: r0.Ladder, RungIndex: 1}, &r1)
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("approve rung 1 status = %d, want 200", resp.StatusCode)
-	}
-	if r1.Recommendation.Decision != string(brain.Stop) {
+	r1 := runRung(t, srv.URL, r0.Ladder, 1)
+	if r1.Recommendation == nil || r1.Recommendation.Decision != string(brain.Stop) {
 		t.Errorf("rung 1 decision = %q, want stop (top of the ladder)", r1.Recommendation.Decision)
 	}
 	if r1.NextProposal != nil {
@@ -167,8 +200,12 @@ func TestApproveNoTensorEgress(t *testing.T) {
 	var planned proposeResp
 	postJSON(t, srv.URL+"/api/propose", proposeReq{Question: "why?"}, &planned)
 
-	body, _ := json.Marshal(approveReq{Ladder: planned.Ladder, RungIndex: 0})
-	resp, err := http.Post(srv.URL+"/api/approve", "application/json", bytes.NewReader(body))
+	// Drive the rung to completion, then re-read the finished response as raw JSON: the
+	// result only exists once the worker has written it (#66).
+	done := runRung(t, srv.URL, planned.Ladder, 0)
+
+	body, _ := json.Marshal(resultReq{Ladder: done.Ladder, RungIndex: 0, SessionID: done.SessionID})
+	resp, err := http.Post(srv.URL+"/api/result", "application/json", bytes.NewReader(body))
 	if err != nil {
 		t.Fatalf("POST: %v", err)
 	}

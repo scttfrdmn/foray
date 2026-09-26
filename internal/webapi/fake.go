@@ -29,9 +29,13 @@ import (
 func NewFakeDeps() Deps {
 	f := spore.NewFake()
 	gw := &gateway.Gateway{
-		Store:  gateway.NewMemStore(),
-		Worker: gateway.NewFakeWorker(),
-		Spawn:  f.Spawn,
+		Store: gateway.NewMemStore(),
+		Spawn: f.Spawn,
+		// The page uses launch-time handoff, not a live worker endpoint (#66) — so the
+		// rehearsal uses it too, and rehearses the flow the deployed page actually runs.
+		// The fake reports pending once before answering, which keeps the polling path
+		// exercised rather than letting it rot.
+		Handoff: gateway.NewFakeHandoff(),
 	}
 	return Deps{
 		Brain:    brain.NewFakeWith(f.Spawn),

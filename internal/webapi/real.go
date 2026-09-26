@@ -18,10 +18,8 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"net/http"
 	"os"
 	"strconv"
-	"time"
 
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/bedrockruntime"
@@ -79,21 +77,26 @@ func NewRealDeps(ctx context.Context, log *slog.Logger) (Deps, error) {
 		return Deps{}, err
 	}
 
-	table := envOr("FORAY_SESSIONS_TABLE", "foray-sessions")
-	gw := &gateway.Gateway{
-		Store:  gateway.NewDynamoStore(dynamodb.NewFromConfig(cfg), table),
-		Worker: gateway.HTTPWorker{Client: &http.Client{Timeout: 10 * time.Minute}},
-		Spawn:  spawn,
-	}
-
 	bucket := os.Getenv("FORAY_DATA_BUCKET")
 	if bucket == "" {
 		return Deps{}, fmt.Errorf("set FORAY_DATA_BUCKET to the in-region saves bucket")
 	}
+	s3c := s3.NewFromConfig(cfg)
+
+	table := envOr("FORAY_SESSIONS_TABLE", "foray-sessions")
+	gw := &gateway.Gateway{
+		Store: gateway.NewDynamoStore(dynamodb.NewFromConfig(cfg), table),
+		Spawn: spawn,
+		// Launch-time handoff: the deployed control plane cannot reach the worker (#66),
+		// so the graph goes to the session's prefix in the user's own bucket and the
+		// worker writes its result reference back there. No VPC, no open port, and the
+		// long-timeout HTTP client this path used to need is gone with it.
+		Handoff: gateway.NewS3Handoff(s3c, bucket),
+	}
+
 	// Ownership comes from the session's saves living in the user's own bucket, not
 	// from its instance still running — a finished session is precisely the one a
 	// user exports from (issue #80). Mirrors cmd/foray's buildExporter.
-	s3c := s3.NewFromConfig(cfg)
 	owner := export.NewSessionOwner(s3c, bucket, principal.Subject)
 	pol, err := brain.NewCedarExportPolicy(principal, owner.OwnerFunc(ctx))
 	if err != nil {

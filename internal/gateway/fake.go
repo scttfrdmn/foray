@@ -16,6 +16,7 @@ package gateway
 
 import (
 	"context"
+	"fmt"
 	"sort"
 	"sync"
 	"time"
@@ -161,4 +162,51 @@ func (m *MemStore) Receipts(_ context.Context, questionID string) ([]Receipt, er
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return append([]Receipt(nil), m.receipts[questionID]...), nil
+}
+
+// NewFakeHandoff returns the offline launch-time handoff (issue #66).
+//
+// It reports pending on the first poll for a session and the result on the next. That
+// is deliberate rather than convenient: the deployed page's flow is
+// approve → poll → poll → done, and a fake that answered immediately would let the
+// polling path rot untested. One pending round is enough to exercise it without making
+// `make web-fake` feel slow.
+//
+// References only, never tensors — the same guarantee fakeWorker gives.
+func NewFakeHandoff() Handoff { return &fakeHandoff{polled: map[string]int{}} }
+
+type fakeHandoff struct {
+	mu     sync.Mutex
+	graphs map[string]Graph
+	polled map[string]int
+}
+
+func (f *fakeHandoff) PutGraph(_ context.Context, sessionID string, g Graph) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.graphs == nil {
+		f.graphs = map[string]Graph{}
+	}
+	f.graphs[sessionID] = g
+	return nil
+}
+
+func (f *fakeHandoff) GetResult(_ context.Context, sessionID string) (TraceResult, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, handed := f.graphs[sessionID]; !handed {
+		// No graph was ever handed over: the worker would be waiting forever, so say so
+		// rather than report a trace that never finishes.
+		return TraceResult{}, false, fmt.Errorf("%w: no graph was handed to %s", ErrTraceFailed, sessionID)
+	}
+	f.polled[sessionID]++
+	if f.polled[sessionID] < 2 {
+		return TraceResult{}, true, nil
+	}
+	return TraceResult{
+		SessionID: sessionID,
+		SaveRef:   "s3://your-bucket-us-east-1/sessions/" + sessionID + "/activations/",
+		VizRef:    "viz://" + sessionID + "/logit-lens.png",
+		NNSight:   "with model.trace(prompt) as t:\n    logits = model.lm_head.output.save()",
+	}, false, nil
 }

@@ -38,7 +38,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -90,6 +89,7 @@ func Handler(d Deps, log *slog.Logger) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /api/propose", d.handlePropose(log))
 	mux.HandleFunc("POST /api/approve", d.handleApprove(log))
+	mux.HandleFunc("POST /api/result", d.handleResult(log))
 	mux.HandleFunc("GET /api/receipt", d.handleReceipt(log))
 	mux.HandleFunc("POST /api/export", d.handleExport(log))
 	mux.HandleFunc("GET /healthz", handleHealthz)
@@ -149,18 +149,30 @@ type approveReq struct {
 	RungIndex int           `json:"rungIndex"`
 }
 
-// approveResp is one rung's outcome: the launched session, the finding framed
-// against the question, the climb/stop recommendation, the updated ladder to
-// carry forward, and — if the brain recommends climbing — the next rung awaiting
-// its own fresh Go (nil otherwise). It carries references only, never tensors.
+// Status values for a rung. A trace no longer completes inside one request: the
+// deployed control plane cannot reach the worker, so the graph is handed over at launch
+// and the worker writes its result back (#66). Approve therefore returns `running`, and
+// the page polls /api/result until `done`.
+const (
+	StatusRunning = "running"
+	StatusDone    = "done"
+)
+
+// approveResp is one rung's outcome, and also what /api/result returns — the two share
+// a shape so the page has one thing to render.
+//
+// While Status is `running`, Result and Recommendation are absent: the trace is still
+// going, and inventing a placeholder finding would be worse than showing none. It
+// carries references only, never tensors.
 type approveResp struct {
-	SessionID      string         `json:"sessionId"`
-	Result         *resultView    `json:"result"`
-	Recommendation recommendation `json:"recommendation"`
-	Ladder         *brain.Ladder  `json:"ladder"`
-	NextProposal   *rungView      `json:"nextProposal,omitempty"`
-	SpentUSD       float64        `json:"spentUSD"`
-	BudgetUSD      float64        `json:"budgetUSD"`
+	Status         string          `json:"status"`
+	SessionID      string          `json:"sessionId"`
+	Result         *resultView     `json:"result,omitempty"`
+	Recommendation *recommendation `json:"recommendation,omitempty"`
+	Ladder         *brain.Ladder   `json:"ladder"`
+	NextProposal   *rungView       `json:"nextProposal,omitempty"`
+	SpentUSD       float64         `json:"spentUSD"`
+	BudgetUSD      float64         `json:"budgetUSD"`
 }
 
 // handleApprove is the HITL acceptance node over HTTP: it runs exactly one
@@ -193,21 +205,128 @@ func (d Deps) handleApprove(log *slog.Logger) http.HandlerFunc {
 			return
 		}
 
-		// Fetch the rung's result through the gateway (forayd's library, hosted
-		// in-process exactly as the CLI does): register maps session→worker, trace
-		// routes the graph and bridges the idle signal; only references return.
+		// Record the session first: Collect resolves through it, and the idle bridge
+		// needs a row to stamp.
 		if err := d.register(ctx, sid); err != nil {
 			log.Warn("approve: register", "session", sid, "err", err)
 			writeErr(w, http.StatusBadGateway, err.Error())
 			return
 		}
-		tr, err := d.Gateway.Route(ctx, sid, gateway.Graph{
+
+		// Hand the graph to the instance instead of reaching the worker.
+		//
+		// The deployed control plane has no path to the worker — a Lambda cannot hold
+		// the SSH forward the CLI's `spawn service` tunnel uses, and the alternatives
+		// broke either the ~$0 invariant or the loopback-only posture (#66). It does not
+		// need one: the rung runs exactly one trace, so the work is fully known and is
+		// written to the session's own bucket prefix for the booting worker to collect.
+		//
+		// The graph goes over AFTER the launch because its key contains the instance id.
+		// The worker waits for it (worker/batch.py), so being a moment late is fine.
+		if err := d.Gateway.HandOff(ctx, sid, gateway.Graph{
 			Engine:  string(rung.Engine),
 			Payload: []byte(rung.NNSight),
-		})
-		if err != nil {
-			log.Warn("approve: trace", "session", sid, "err", err)
+		}); err != nil {
+			log.Warn("approve: handoff", "session", sid, "err", err)
 			writeErr(w, http.StatusBadGateway, err.Error())
+			return
+		}
+
+		// The receipt records the spend the brain already booked in Approve. It is
+		// written here rather than after the trace because the money is committed at
+		// launch: the instance is running whether or not the trace succeeds, so a page
+		// reload must show that cost. Best-effort — a lost receipt must not fail a rung.
+		if err := gateway.RecordReceipt(ctx, d.Gateway.Store, d.receiptFor(l, rung, sid)); err != nil {
+			log.Warn("approve: record receipt", "session", sid, "rung", rung.Index, "err", err)
+		}
+
+		writeJSON(w, http.StatusOK, approveResp{
+			Status:    StatusRunning,
+			SessionID: sid,
+			Ladder:    l,
+			SpentUSD:  l.Spent,
+			BudgetUSD: l.Question.BudgetUSD,
+		})
+	}
+}
+
+// receiptFor builds the per-question cost receipt for one approved rung.
+//
+// It records a fact — the brain already booked the spend in Approve — and never settles
+// acceptance. Persisted so a page reload still shows an authoritative $-so-far: the
+// stateless contract discards the live Ladder between calls.
+func (d Deps) receiptFor(l *brain.Ladder, rung *brain.Rung, sid string) gateway.Receipt {
+	return gateway.Receipt{
+		QuestionID:   gateway.QuestionID(l.Question.Text),
+		QuestionText: l.Question.Text,
+		Rung:         rung.Index,
+		SessionID:    sid,
+		Technique:    rung.Technique,
+		Model:        rung.Model.Name,
+		EstCostUSD:   rung.EstCostUSD,
+		SpentUSD:     l.Spent,
+		BudgetUSD:    l.Question.BudgetUSD,
+		At:           d.now(),
+	}
+}
+
+// --- /api/result -------------------------------------------------------------
+
+// resultReq asks whether a launched rung has finished. The ladder rides along because
+// the contract is stateless (the server keeps no live Ladder between calls) and
+// interpreting a result needs the question it serves.
+type resultReq struct {
+	Ladder    *brain.Ladder `json:"ladder"`
+	RungIndex int           `json:"rungIndex"`
+	SessionID string        `json:"sessionId"`
+}
+
+// handleResult collects a handed-off trace and, once it lands, does the rest of the
+// rung: interpret the finding against the question, assess climb-or-stop, and offer the
+// next rung — which still awaits its own fresh Go.
+//
+// This is the second half of what used to happen inside approve. Splitting it is what
+// launch-time handoff requires, and it is also better shaped for a cold Lambda: nothing
+// sits holding a connection for the length of a GPU trace.
+func (d Deps) handleResult(log *slog.Logger) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var req resultReq
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeErr(w, http.StatusBadRequest, "invalid request body")
+			return
+		}
+		l := req.Ladder
+		if l == nil || req.RungIndex < 0 || req.RungIndex >= len(l.Rungs) {
+			writeErr(w, http.StatusBadRequest, "ladder with a valid rungIndex is required")
+			return
+		}
+		if req.SessionID == "" {
+			writeErr(w, http.StatusBadRequest, "sessionId is required")
+			return
+		}
+		ctx := r.Context()
+		rung := &l.Rungs[req.RungIndex]
+
+		tr, pending, err := d.Gateway.Collect(ctx, req.SessionID)
+		if err != nil {
+			// A worker that reported a failure, or a session we cannot resolve. Either
+			// way the rung is over; say why rather than let the page poll forever.
+			log.Warn("result: collect", "session", req.SessionID, "err", err)
+			status := http.StatusBadGateway
+			if errors.Is(err, gateway.ErrUnknownSession) {
+				status = http.StatusNotFound
+			}
+			writeErr(w, status, err.Error())
+			return
+		}
+		if pending {
+			writeJSON(w, http.StatusOK, approveResp{
+				Status:    StatusRunning,
+				SessionID: req.SessionID,
+				Ladder:    l,
+				SpentUSD:  l.Spent,
+				BudgetUSD: l.Question.BudgetUSD,
+			})
 			return
 		}
 
@@ -215,42 +334,23 @@ func (d Deps) handleApprove(log *slog.Logger) http.HandlerFunc {
 			SaveRef: tr.SaveRef, VizRef: tr.VizRef, NNSight: tr.NNSight,
 		})
 		if err != nil {
-			log.Warn("approve: interpret", "session", sid, "err", err)
+			log.Warn("result: interpret", "session", req.SessionID, "err", err)
 			writeErr(w, http.StatusBadGateway, err.Error())
 			return
 		}
 
 		rec, err := d.Brain.Assess(ctx, l, res)
 		if err != nil {
-			log.Warn("approve: assess", "session", sid, "err", err)
+			log.Warn("result: assess", "session", req.SessionID, "err", err)
 			writeErr(w, http.StatusBadGateway, err.Error())
 			return
 		}
 
-		// Persist the per-question receipt so a page reload (the stateless contract
-		// discards the live Ladder) still shows an authoritative $-so-far. The
-		// brain already booked the spend in Approve; we record the fact, never
-		// settle acceptance. Best-effort: a lost receipt must not fail the trace.
-		receipt := gateway.Receipt{
-			QuestionID:   gateway.QuestionID(l.Question.Text),
-			QuestionText: l.Question.Text,
-			Rung:         rung.Index,
-			SessionID:    sid,
-			Technique:    rung.Technique,
-			Model:        rung.Model.Name,
-			EstCostUSD:   rung.EstCostUSD,
-			SpentUSD:     l.Spent,
-			BudgetUSD:    l.Question.BudgetUSD,
-			At:           d.now(),
-		}
-		if err := gateway.RecordReceipt(ctx, d.Gateway.Store, receipt); err != nil {
-			log.Warn("approve: record receipt", "session", sid, "rung", rung.Index, "err", err)
-		}
-
 		resp := approveResp{
-			SessionID:      sid,
+			Status:         StatusDone,
+			SessionID:      req.SessionID,
 			Result:         viewResult(res, tr),
-			Recommendation: recommendation{Decision: string(rec.Decision), Reason: rec.Reason},
+			Recommendation: &recommendation{Decision: string(rec.Decision), Reason: rec.Reason},
 			Ladder:         l,
 			SpentUSD:       l.Spent,
 			BudgetUSD:      l.Question.BudgetUSD,
@@ -403,28 +503,13 @@ func handleHealthz(w http.ResponseWriter, _ *http.Request) {
 // register maps a just-launched session to its worker so Route can resolve it,
 // exactly as the CLI's tracer does. spawn.Status finds the instance the brain's
 // executor launched (in the fake, executor and gateway share one fake spawn).
+// register records the session→instance mapping so Collect can resolve it and the idle
+// bridge has a row to stamp.
+//
+// It no longer looks up an address. Under launch-time handoff the deployed path never
+// dials the worker, so it does not need the instance's public IP — which also means one
+// fewer spawn call per rung, and no dependency on the instance being reachable at all.
+// The session id IS the instance id (brain.SpawnExecutor returns it).
 func (d Deps) register(ctx context.Context, sid string) error {
-	inst, err := d.Spawn.Status(ctx, sid)
-	if err != nil {
-		return err
-	}
-	url, err := workerURL(inst)
-	if err != nil {
-		return err
-	}
-	return d.Gateway.Store.Put(ctx, gateway.Session{
-		ID:         sid,
-		InstanceID: inst.ID,
-		WorkerURL:  url,
-	})
-}
-
-// workerURL is where the session's worker accepts graphs (FastAPI on :8000).
-// A missing address is an error, not a fallback to the instance ID — see the
-// twin in cmd/foray for why that fallback hid a real bug.
-func workerURL(inst spore.Instance) (string, error) {
-	if inst.PublicIP == "" {
-		return "", fmt.Errorf("instance %s has no public address yet (state %q)", inst.ID, inst.State)
-	}
-	return "http://" + inst.PublicIP + ":8000", nil
+	return d.Gateway.Store.Put(ctx, gateway.Session{ID: sid, InstanceID: sid})
 }
