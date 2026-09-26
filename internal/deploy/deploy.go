@@ -91,10 +91,34 @@ type Config struct {
 	// AccountID is resolved by New (via STS) and used to build the IAM policy ARNs.
 	// Tests set it directly.
 	AccountID string
+
+	// GatewayZip and WebAPIZip are the built Lambda packages
+	// (provided.al2023/arm64, binary named `bootstrap`). `make lambdas` produces
+	// them; a deploy without them fails before touching AWS.
+	GatewayZip string
+	WebAPIZip  string
+
+	// LWALayerARN pins the AWS Lambda Web Adapter layer. Empty resolves the newest
+	// published version for the region, which is the point of the verb — a
+	// hand-pinned, region-specific ARN was the friction Terraform imposed, and a
+	// wrong one is a silent 503 (see lwa.go).
+	LWALayerARN string
+
+	// BudgetCeilingUSD is the per-session Cedar ceiling injected into the web API.
+	BudgetCeilingUSD float64
+
+	// LogRetentionDays bounds log storage, the one thing here that bills by the
+	// GB-month with no TTL of its own.
+	LogRetentionDays int32
 }
 
-// DefaultPlanModelID matches deploy/terraform/variables.tf and the CLI default.
-const DefaultPlanModelID = "us.anthropic.claude-sonnet-4-6"
+// Defaults mirroring deploy/terraform/variables.tf and the Makefile's build paths.
+const (
+	DefaultPlanModelID      = "us.anthropic.claude-sonnet-4-6"
+	DefaultBudgetCeilingUSD = 5.00
+	DefaultGatewayZip       = "build/forayd.zip"
+	DefaultWebAPIZip        = "build/foray-web.zip"
+)
 
 // DefaultSessionsTable matches deploy/terraform/variables.tf.
 const DefaultSessionsTable = "foray-sessions"
@@ -112,6 +136,18 @@ func (c *Config) Validate() error {
 	}
 	if c.PlanModelID == "" {
 		c.PlanModelID = DefaultPlanModelID
+	}
+	if c.BudgetCeilingUSD <= 0 {
+		c.BudgetCeilingUSD = DefaultBudgetCeilingUSD
+	}
+	if c.LogRetentionDays <= 0 {
+		c.LogRetentionDays = DefaultLogRetentionDays
+	}
+	if c.GatewayZip == "" {
+		c.GatewayZip = DefaultGatewayZip
+	}
+	if c.WebAPIZip == "" {
+		c.WebAPIZip = DefaultWebAPIZip
 	}
 	var missing []string
 	if strings.TrimSpace(c.Region) == "" {

@@ -13,6 +13,42 @@ prefix.
 
 ### Added
 
+- **`foray deploy`: the two Lambda functions, their log groups, and automatic
+  Lambda Web Adapter layer resolution (#85, third increment).**
+  - **The LWA layer ARN is now resolved at deploy time** instead of pasted into a
+    tfvars file. Keeping the adapter is deliberate: it is why `cmd/forayd` and
+    `cmd/foray-web` run on Lambda as *unmodified* `http.Server` binaries with no
+    `aws-lambda-go` and no proxy shim. What it cost was a region-specific, versioned
+    ARN whose mismatch is a **silent** failure — the readiness check never passes and
+    API Gateway returns 503 with nothing in the application log (PR #64). Resolution
+    removes that friction without giving up the property; `--lwa-layer-arn` still
+    pins it for an air-gapped account, a private mirror, or a known-good version.
+    Resolution happens *before* anything is created, so an unresolvable layer fails a
+    deploy that has not yet touched the account.
+  - **`AWS_LWA_PORT` is set per function** (gateway 8080, web API 8090) with the
+    constants adjacent and a test asserting they differ — this is the #64 bug, and
+    the `foray deploy` output now shows both ports so a shared value is visible at a
+    glance.
+  - **`CreateFunction` retries IAM propagation.** IAM is eventually consistent and
+    this package creates the roles itself, so a first deploy almost always hits the
+    window where Lambda rejects a role as not-yet-assumable. That specific error is
+    retried; anything else fails fast, so a typo does not look like a hang.
+  - Code is republished only when the package's sha256 differs from the deployed
+    one, and configuration (env, layer, timeout, memory) converges on every run —
+    the LWA env in particular is what makes the function respond at all.
+  - **Log groups are created explicitly**, before their functions. A group Lambda
+    creates implicitly on first invocation retains **forever**, and log storage is
+    one of the few things here that bills by the GB-month with no TTL of its own;
+    creating them also gives teardown something to delete. Retention converges on
+    existing groups for exactly the implicit-creation case. Tagging a log group is
+    best-effort, since some accounts restrict it and nothing that bills is tracked
+    only by that tag.
+  - Adds `service/lambda` and `service/cloudwatchlogs`.
+  - The drift guard now covers `lambda.tf` too — function names, **both LWA ports**,
+    the exec wrapper and readiness path, runtime, architecture, the bundled-truffle
+    `PATH`, and the log group names. A port fixed in one path and not the other would
+    otherwise bring the silent 503 back on the next deploy the other way.
+
 - **`foray deploy`: the three IAM roles and the spawn instance profile (#85,
   second increment).** Mirrors `deploy/terraform/iam.tf` statement for statement:
   - `foray-gateway-lambda` — forayd: the sessions table and nothing else. Four

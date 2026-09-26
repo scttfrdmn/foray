@@ -30,15 +30,37 @@ func testConfig() Config {
 	}
 }
 
-// resourceCount is how many resources a full Apply touches: the sessions table,
-// two buckets, three IAM roles and the spawn instance profile.
-const resourceCount = 7
+// resourceCount is how many resources a full Apply touches: the sessions table, two
+// buckets, three IAM roles, the spawn instance profile, two log groups and two
+// Lambda functions.
+const resourceCount = 11
+
+// testFakes bundles the stand-ins so tests can reach whichever they assert on.
+type testFakes struct {
+	ddb  *fakeDynamo
+	s3   *fakeS3
+	iam  *fakeIAM
+	lam  *fakeLambda
+	logs *fakeLogs
+}
 
 // newTestDeployer builds the real resource list over fakes.
-func newTestDeployer(t *testing.T, cfg Config) (*Deployer, *fakeDynamo, *fakeS3, *fakeIAM) {
+func newTestDeployer(t *testing.T, cfg Config) (*Deployer, *testFakes) {
 	t.Helper()
-	ddb, s3c, iamc := newFakeDynamo(), newFakeS3(), newFakeIAM()
-	return newWith(mustValidate(t, cfg), ddb, s3c, iamc), ddb, s3c, iamc
+	f := &testFakes{
+		ddb:  newFakeDynamo(),
+		s3:   newFakeS3(),
+		iam:  newFakeIAM(),
+		lam:  newFakeLambda(),
+		logs: newFakeLogs(),
+	}
+	cfg = mustValidate(t, cfg)
+	if cfg.LWALayerARN == "" {
+		cfg.LWALayerARN = lwaLayerBase(cfg.Region) + ":25"
+	}
+	zip := func(path string) ([]byte, error) { return []byte("zip:" + path), nil }
+	d := newWithZips(cfg, f.ddb, f.s3, f.iam, f.lam, f.logs, zip)
+	return d, f
 }
 
 func TestConfigValidate(t *testing.T) {
@@ -114,7 +136,7 @@ func TestTagsAlwaysCarryProject(t *testing.T) {
 // nothing. Without a state file this is the property the whole package rests on —
 // a half-finished deploy is fixed by running it again.
 func TestApplyIsIdempotent(t *testing.T) {
-	d, _, _, _ := newTestDeployer(t, testConfig())
+	d, _ := newTestDeployer(t, testConfig())
 
 	first, err := d.Apply(context.Background())
 	if err != nil {
@@ -142,7 +164,8 @@ func TestApplyIsIdempotent(t *testing.T) {
 
 // Teardown removes what Apply made, and a second Teardown finds nothing to do.
 func TestTeardownRemovesEverythingAndIsIdempotent(t *testing.T) {
-	d, ddb, s3c, _ := newTestDeployer(t, testConfig())
+	d, f := newTestDeployer(t, testConfig())
+	ddb, s3c := f.ddb, f.s3
 
 	if _, err := d.Apply(context.Background()); err != nil {
 		t.Fatalf("Apply: %v", err)
@@ -178,7 +201,7 @@ func TestTeardownRemovesEverythingAndIsIdempotent(t *testing.T) {
 // Teardown runs in reverse dependency order, so later resources come off before
 // the ones they were built on.
 func TestTeardownReversesApplyOrder(t *testing.T) {
-	d, _, _, _ := newTestDeployer(t, testConfig())
+	d, _ := newTestDeployer(t, testConfig())
 
 	applied, err := d.Apply(context.Background())
 	if err != nil {
@@ -203,7 +226,8 @@ func TestTeardownReversesApplyOrder(t *testing.T) {
 // left billing, so one stubborn resource cannot shield the rest.
 func TestTeardownContinuesPastAFailure(t *testing.T) {
 	cfg := mustValidate(t, testConfig())
-	d, ddb, s3c, _ := newTestDeployer(t, cfg)
+	d, f := newTestDeployer(t, cfg)
+	ddb, s3c := f.ddb, f.s3
 	if _, err := d.Apply(context.Background()); err != nil {
 		t.Fatalf("Apply: %v", err)
 	}
@@ -235,7 +259,8 @@ func TestTeardownContinuesPastAFailure(t *testing.T) {
 // file for the caller to consult.
 func TestApplyStopsAtFirstFailureAndReportsProgress(t *testing.T) {
 	cfg := mustValidate(t, testConfig())
-	d, _, s3c, _ := newTestDeployer(t, cfg)
+	d, f := newTestDeployer(t, cfg)
+	s3c := f.s3
 	s3c.failCreate[cfg.WebBucket] = errors.New("boom")
 	actions, err := d.Apply(context.Background())
 	if err == nil {
@@ -252,7 +277,8 @@ func TestApplyStopsAtFirstFailureAndReportsProgress(t *testing.T) {
 
 // A dry run reports the plan and touches nothing.
 func TestDryRunMutatesNothing(t *testing.T) {
-	d, ddb, s3c, _ := newTestDeployer(t, testConfig())
+	d, f := newTestDeployer(t, testConfig())
+	ddb, s3c := f.ddb, f.s3
 	d.DryRun = true
 
 	actions, err := d.Apply(context.Background())
