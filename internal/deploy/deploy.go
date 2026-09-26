@@ -82,7 +82,19 @@ type Config struct {
 
 	// SessionsTable is the session<->instance map plus per-question cost receipts.
 	SessionsTable string
+
+	// PlanModelID is the Bedrock inference profile the brain plans with. It is a
+	// policy input, not just a runtime setting: the web API's role is scoped to
+	// exactly this profile's ARN.
+	PlanModelID string
+
+	// AccountID is resolved by New (via STS) and used to build the IAM policy ARNs.
+	// Tests set it directly.
+	AccountID string
 }
+
+// DefaultPlanModelID matches deploy/terraform/variables.tf and the CLI default.
+const DefaultPlanModelID = "us.anthropic.claude-sonnet-4-6"
 
 // DefaultSessionsTable matches deploy/terraform/variables.tf.
 const DefaultSessionsTable = "foray-sessions"
@@ -97,6 +109,9 @@ var ErrConfig = errors.New("deploy: invalid configuration")
 func (c *Config) Validate() error {
 	if c.SessionsTable == "" {
 		c.SessionsTable = DefaultSessionsTable
+	}
+	if c.PlanModelID == "" {
+		c.PlanModelID = DefaultPlanModelID
 	}
 	var missing []string
 	if strings.TrimSpace(c.Region) == "" {

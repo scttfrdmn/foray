@@ -19,8 +19,13 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	"net/url"
+	"sort"
+
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	ddbtypes "github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
+	"github.com/aws/aws-sdk-go-v2/service/iam"
+	iamtypes "github.com/aws/aws-sdk-go-v2/service/iam/types"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 )
@@ -276,5 +281,241 @@ func NewFake(cfg Config) (*Deployer, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
-	return newWith(cfg, newFakeDynamo(), newFakeS3()), nil
+	if cfg.AccountID == "" {
+		// A syntactically valid 12-digit account id, so the policy ARNs the fake
+		// builds look like the real ones.
+		cfg.AccountID = "000000000000"
+	}
+	return newWith(cfg, newFakeDynamo(), newFakeS3(), newFakeIAM()), nil
+}
+
+// --- IAM --------------------------------------------------------------------
+
+type fakeRole struct {
+	assumeDoc string
+	inline    map[string]string
+	attached  map[string]struct{}
+	tags      map[string]string
+}
+
+type fakeProfile struct {
+	roles map[string]struct{}
+	tags  map[string]string
+}
+
+type fakeIAM struct {
+	roles    map[string]*fakeRole
+	profiles map[string]*fakeProfile
+}
+
+func newFakeIAM() *fakeIAM {
+	return &fakeIAM{roles: map[string]*fakeRole{}, profiles: map[string]*fakeProfile{}}
+}
+
+func (f *fakeIAM) GetRole(_ context.Context, in *iam.GetRoleInput, _ ...func(*iam.Options)) (*iam.GetRoleOutput, error) {
+	name := aws.ToString(in.RoleName)
+	r, ok := f.roles[name]
+	if !ok {
+		return nil, &iamtypes.NoSuchEntityException{Message: aws.String("no such role")}
+	}
+	return &iam.GetRoleOutput{Role: &iamtypes.Role{
+		RoleName: in.RoleName,
+		// IAM returns the trust policy URL-encoded; mirror that so a test comparing
+		// documents has to decode, exactly as it would against the real API.
+		AssumeRolePolicyDocument: aws.String(url.QueryEscape(r.assumeDoc)),
+	}}, nil
+}
+
+func (f *fakeIAM) CreateRole(_ context.Context, in *iam.CreateRoleInput, _ ...func(*iam.Options)) (*iam.CreateRoleOutput, error) {
+	name := aws.ToString(in.RoleName)
+	if _, ok := f.roles[name]; ok {
+		return nil, &iamtypes.EntityAlreadyExistsException{Message: aws.String("exists")}
+	}
+	tags := map[string]string{}
+	for _, t := range in.Tags {
+		tags[aws.ToString(t.Key)] = aws.ToString(t.Value)
+	}
+	f.roles[name] = &fakeRole{
+		assumeDoc: aws.ToString(in.AssumeRolePolicyDocument),
+		inline:    map[string]string{},
+		attached:  map[string]struct{}{},
+		tags:      tags,
+	}
+	return &iam.CreateRoleOutput{}, nil
+}
+
+// DeleteRole models IAM's refusal to delete a role that still carries policies —
+// the constraint that makes teardown ordering load-bearing.
+func (f *fakeIAM) DeleteRole(_ context.Context, in *iam.DeleteRoleInput, _ ...func(*iam.Options)) (*iam.DeleteRoleOutput, error) {
+	name := aws.ToString(in.RoleName)
+	r, ok := f.roles[name]
+	if !ok {
+		return nil, &iamtypes.NoSuchEntityException{Message: aws.String("no such role")}
+	}
+	if len(r.inline) > 0 || len(r.attached) > 0 {
+		return nil, &iamtypes.DeleteConflictException{
+			Message: aws.String("Cannot delete entity, must delete policies first"),
+		}
+	}
+	// A role still held by an instance profile cannot be deleted either.
+	for pn, p := range f.profiles {
+		if _, held := p.roles[name]; held {
+			return nil, &iamtypes.DeleteConflictException{
+				Message: aws.String("Cannot delete entity, must remove roles from instance profile " + pn),
+			}
+		}
+	}
+	delete(f.roles, name)
+	return &iam.DeleteRoleOutput{}, nil
+}
+
+func (f *fakeIAM) UpdateAssumeRolePolicy(_ context.Context, in *iam.UpdateAssumeRolePolicyInput, _ ...func(*iam.Options)) (*iam.UpdateAssumeRolePolicyOutput, error) {
+	if r, ok := f.roles[aws.ToString(in.RoleName)]; ok {
+		r.assumeDoc = aws.ToString(in.PolicyDocument)
+	}
+	return &iam.UpdateAssumeRolePolicyOutput{}, nil
+}
+
+func (f *fakeIAM) TagRole(_ context.Context, in *iam.TagRoleInput, _ ...func(*iam.Options)) (*iam.TagRoleOutput, error) {
+	if r, ok := f.roles[aws.ToString(in.RoleName)]; ok {
+		for _, t := range in.Tags {
+			r.tags[aws.ToString(t.Key)] = aws.ToString(t.Value)
+		}
+	}
+	return &iam.TagRoleOutput{}, nil
+}
+
+func (f *fakeIAM) PutRolePolicy(_ context.Context, in *iam.PutRolePolicyInput, _ ...func(*iam.Options)) (*iam.PutRolePolicyOutput, error) {
+	r, ok := f.roles[aws.ToString(in.RoleName)]
+	if !ok {
+		return nil, &iamtypes.NoSuchEntityException{}
+	}
+	r.inline[aws.ToString(in.PolicyName)] = aws.ToString(in.PolicyDocument)
+	return &iam.PutRolePolicyOutput{}, nil
+}
+
+func (f *fakeIAM) DeleteRolePolicy(_ context.Context, in *iam.DeleteRolePolicyInput, _ ...func(*iam.Options)) (*iam.DeleteRolePolicyOutput, error) {
+	if r, ok := f.roles[aws.ToString(in.RoleName)]; ok {
+		delete(r.inline, aws.ToString(in.PolicyName))
+	}
+	return &iam.DeleteRolePolicyOutput{}, nil
+}
+
+func (f *fakeIAM) ListRolePolicies(_ context.Context, in *iam.ListRolePoliciesInput, _ ...func(*iam.Options)) (*iam.ListRolePoliciesOutput, error) {
+	r, ok := f.roles[aws.ToString(in.RoleName)]
+	if !ok {
+		return nil, &iamtypes.NoSuchEntityException{}
+	}
+	out := &iam.ListRolePoliciesOutput{}
+	for n := range r.inline {
+		out.PolicyNames = append(out.PolicyNames, n)
+	}
+	sort.Strings(out.PolicyNames)
+	return out, nil
+}
+
+func (f *fakeIAM) AttachRolePolicy(_ context.Context, in *iam.AttachRolePolicyInput, _ ...func(*iam.Options)) (*iam.AttachRolePolicyOutput, error) {
+	r, ok := f.roles[aws.ToString(in.RoleName)]
+	if !ok {
+		return nil, &iamtypes.NoSuchEntityException{}
+	}
+	// Attaching twice is a no-op in IAM, which is why ensure can Put unconditionally.
+	r.attached[aws.ToString(in.PolicyArn)] = struct{}{}
+	return &iam.AttachRolePolicyOutput{}, nil
+}
+
+func (f *fakeIAM) DetachRolePolicy(_ context.Context, in *iam.DetachRolePolicyInput, _ ...func(*iam.Options)) (*iam.DetachRolePolicyOutput, error) {
+	if r, ok := f.roles[aws.ToString(in.RoleName)]; ok {
+		delete(r.attached, aws.ToString(in.PolicyArn))
+	}
+	return &iam.DetachRolePolicyOutput{}, nil
+}
+
+func (f *fakeIAM) ListAttachedRolePolicies(_ context.Context, in *iam.ListAttachedRolePoliciesInput, _ ...func(*iam.Options)) (*iam.ListAttachedRolePoliciesOutput, error) {
+	r, ok := f.roles[aws.ToString(in.RoleName)]
+	if !ok {
+		return nil, &iamtypes.NoSuchEntityException{}
+	}
+	out := &iam.ListAttachedRolePoliciesOutput{}
+	arns := make([]string, 0, len(r.attached))
+	for a := range r.attached {
+		arns = append(arns, a)
+	}
+	sort.Strings(arns)
+	for _, a := range arns {
+		out.AttachedPolicies = append(out.AttachedPolicies, iamtypes.AttachedPolicy{PolicyArn: aws.String(a)})
+	}
+	return out, nil
+}
+
+func (f *fakeIAM) GetInstanceProfile(_ context.Context, in *iam.GetInstanceProfileInput, _ ...func(*iam.Options)) (*iam.GetInstanceProfileOutput, error) {
+	name := aws.ToString(in.InstanceProfileName)
+	p, ok := f.profiles[name]
+	if !ok {
+		return nil, &iamtypes.NoSuchEntityException{Message: aws.String("no such instance profile")}
+	}
+	out := &iam.GetInstanceProfileOutput{InstanceProfile: &iamtypes.InstanceProfile{
+		InstanceProfileName: in.InstanceProfileName,
+	}}
+	names := make([]string, 0, len(p.roles))
+	for r := range p.roles {
+		names = append(names, r)
+	}
+	sort.Strings(names)
+	for _, r := range names {
+		out.InstanceProfile.Roles = append(out.InstanceProfile.Roles, iamtypes.Role{RoleName: aws.String(r)})
+	}
+	return out, nil
+}
+
+func (f *fakeIAM) CreateInstanceProfile(_ context.Context, in *iam.CreateInstanceProfileInput, _ ...func(*iam.Options)) (*iam.CreateInstanceProfileOutput, error) {
+	name := aws.ToString(in.InstanceProfileName)
+	if _, ok := f.profiles[name]; ok {
+		return nil, &iamtypes.EntityAlreadyExistsException{}
+	}
+	tags := map[string]string{}
+	for _, t := range in.Tags {
+		tags[aws.ToString(t.Key)] = aws.ToString(t.Value)
+	}
+	f.profiles[name] = &fakeProfile{roles: map[string]struct{}{}, tags: tags}
+	return &iam.CreateInstanceProfileOutput{}, nil
+}
+
+// DeleteInstanceProfile models IAM's refusal while a role is still attached.
+func (f *fakeIAM) DeleteInstanceProfile(_ context.Context, in *iam.DeleteInstanceProfileInput, _ ...func(*iam.Options)) (*iam.DeleteInstanceProfileOutput, error) {
+	name := aws.ToString(in.InstanceProfileName)
+	p, ok := f.profiles[name]
+	if !ok {
+		return nil, &iamtypes.NoSuchEntityException{}
+	}
+	if len(p.roles) > 0 {
+		return nil, &iamtypes.DeleteConflictException{
+			Message: aws.String("Cannot delete entity, must remove roles from instance profile first"),
+		}
+	}
+	delete(f.profiles, name)
+	return &iam.DeleteInstanceProfileOutput{}, nil
+}
+
+// AddRoleToInstanceProfile models the one-role limit: a second role is a
+// LimitExceeded, which is why ensure checks before adding.
+func (f *fakeIAM) AddRoleToInstanceProfile(_ context.Context, in *iam.AddRoleToInstanceProfileInput, _ ...func(*iam.Options)) (*iam.AddRoleToInstanceProfileOutput, error) {
+	p, ok := f.profiles[aws.ToString(in.InstanceProfileName)]
+	if !ok {
+		return nil, &iamtypes.NoSuchEntityException{}
+	}
+	if len(p.roles) > 0 {
+		return nil, &iamtypes.LimitExceededException{
+			Message: aws.String("Cannot exceed quota for InstanceSessionsPerInstanceProfile: 1"),
+		}
+	}
+	p.roles[aws.ToString(in.RoleName)] = struct{}{}
+	return &iam.AddRoleToInstanceProfileOutput{}, nil
+}
+
+func (f *fakeIAM) RemoveRoleFromInstanceProfile(_ context.Context, in *iam.RemoveRoleFromInstanceProfileInput, _ ...func(*iam.Options)) (*iam.RemoveRoleFromInstanceProfileOutput, error) {
+	if p, ok := f.profiles[aws.ToString(in.InstanceProfileName)]; ok {
+		delete(p.roles, aws.ToString(in.RoleName))
+	}
+	return &iam.RemoveRoleFromInstanceProfileOutput{}, nil
 }

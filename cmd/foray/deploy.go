@@ -35,6 +35,7 @@ func deployCmd(ctx context.Context, args []string) {
 		webBucket  = fs.String("web-bucket", os.Getenv("FORAY_WEB_BUCKET"), "globally-unique S3 bucket for the SPA (default $FORAY_WEB_BUCKET)")
 		dataBucket = fs.String("data-bucket", os.Getenv("FORAY_DATA_BUCKET"), "globally-unique S3 bucket for in-region saves (default $FORAY_DATA_BUCKET)")
 		table      = fs.String("table", deploy.DefaultSessionsTable, "DynamoDB table for sessions + cost receipts")
+		planModel  = fs.String("plan-model", envOr("FORAY_PLAN_MODEL", deploy.DefaultPlanModelID), "Bedrock inference profile the brain plans with (scopes the web API's IAM policy)")
 		dryRun     = fs.Bool("dry-run", false, "print what would be created, call no mutating API")
 	)
 	_ = fs.Parse(args)
@@ -44,6 +45,7 @@ func deployCmd(ctx context.Context, args []string) {
 		WebBucket:     *webBucket,
 		DataBucket:    *dataBucket,
 		SessionsTable: *table,
+		PlanModelID:   *planModel,
 	})
 	if err != nil {
 		die(err)
@@ -161,7 +163,7 @@ func buildDeployer(ctx context.Context, cfg deploy.Config) (*deploy.Deployer, de
 	if cfg.Region == "" {
 		cfg.Region = awsCfg.Region
 	}
-	d, err := deploy.New(cfg, awsCfg)
+	d, err := deploy.New(ctx, cfg, awsCfg)
 	if err != nil {
 		return nil, cfg, err
 	}

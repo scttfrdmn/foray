@@ -22,7 +22,23 @@ import (
 )
 
 func testConfig() Config {
-	return Config{Region: "us-west-2", WebBucket: "foray-web-123", DataBucket: "foray-data-123"}
+	return Config{
+		Region:     "us-west-2",
+		WebBucket:  "foray-web-123",
+		DataBucket: "foray-data-123",
+		AccountID:  "123456789012",
+	}
+}
+
+// resourceCount is how many resources a full Apply touches: the sessions table,
+// two buckets, three IAM roles and the spawn instance profile.
+const resourceCount = 7
+
+// newTestDeployer builds the real resource list over fakes.
+func newTestDeployer(t *testing.T, cfg Config) (*Deployer, *fakeDynamo, *fakeS3, *fakeIAM) {
+	t.Helper()
+	ddb, s3c, iamc := newFakeDynamo(), newFakeS3(), newFakeIAM()
+	return newWith(mustValidate(t, cfg), ddb, s3c, iamc), ddb, s3c, iamc
 }
 
 func TestConfigValidate(t *testing.T) {
@@ -98,16 +114,14 @@ func TestTagsAlwaysCarryProject(t *testing.T) {
 // nothing. Without a state file this is the property the whole package rests on —
 // a half-finished deploy is fixed by running it again.
 func TestApplyIsIdempotent(t *testing.T) {
-	ddb := newFakeDynamo()
-	s3c := newFakeS3()
-	d := newWith(mustValidate(t, testConfig()), ddb, s3c)
+	d, _, _, _ := newTestDeployer(t, testConfig())
 
 	first, err := d.Apply(context.Background())
 	if err != nil {
 		t.Fatalf("first Apply: %v", err)
 	}
-	if len(first) != 3 {
-		t.Fatalf("got %d actions, want 3 (table + 2 buckets)", len(first))
+	if len(first) != resourceCount {
+		t.Fatalf("got %d actions, want %d", len(first), resourceCount)
 	}
 	for _, a := range first {
 		if a.Op != OpCreate {
@@ -128,9 +142,7 @@ func TestApplyIsIdempotent(t *testing.T) {
 
 // Teardown removes what Apply made, and a second Teardown finds nothing to do.
 func TestTeardownRemovesEverythingAndIsIdempotent(t *testing.T) {
-	ddb := newFakeDynamo()
-	s3c := newFakeS3()
-	d := newWith(mustValidate(t, testConfig()), ddb, s3c)
+	d, ddb, s3c, _ := newTestDeployer(t, testConfig())
 
 	if _, err := d.Apply(context.Background()); err != nil {
 		t.Fatalf("Apply: %v", err)
@@ -166,9 +178,7 @@ func TestTeardownRemovesEverythingAndIsIdempotent(t *testing.T) {
 // Teardown runs in reverse dependency order, so later resources come off before
 // the ones they were built on.
 func TestTeardownReversesApplyOrder(t *testing.T) {
-	ddb := newFakeDynamo()
-	s3c := newFakeS3()
-	d := newWith(mustValidate(t, testConfig()), ddb, s3c)
+	d, _, _, _ := newTestDeployer(t, testConfig())
 
 	applied, err := d.Apply(context.Background())
 	if err != nil {
@@ -192,10 +202,8 @@ func TestTeardownReversesApplyOrder(t *testing.T) {
 // Teardown must not stop at the first failure: the requirement is that nothing is
 // left billing, so one stubborn resource cannot shield the rest.
 func TestTeardownContinuesPastAFailure(t *testing.T) {
-	ddb := newFakeDynamo()
-	s3c := newFakeS3()
 	cfg := mustValidate(t, testConfig())
-	d := newWith(cfg, ddb, s3c)
+	d, ddb, s3c, _ := newTestDeployer(t, cfg)
 	if _, err := d.Apply(context.Background()); err != nil {
 		t.Fatalf("Apply: %v", err)
 	}
@@ -217,8 +225,8 @@ func TestTeardownContinuesPastAFailure(t *testing.T) {
 	if len(ddb.tables) != 0 {
 		t.Error("table survived — teardown stopped early")
 	}
-	if len(actions) != 3 {
-		t.Errorf("got %d actions, want 3 (every resource attempted)", len(actions))
+	if len(actions) != resourceCount {
+		t.Errorf("got %d actions, want %d (every resource attempted)", len(actions), resourceCount)
 	}
 }
 
@@ -226,12 +234,9 @@ func TestTeardownContinuesPastAFailure(t *testing.T) {
 // earlier ones — and it returns what it managed to do, because there is no state
 // file for the caller to consult.
 func TestApplyStopsAtFirstFailureAndReportsProgress(t *testing.T) {
-	ddb := newFakeDynamo()
-	s3c := newFakeS3()
 	cfg := mustValidate(t, testConfig())
+	d, _, s3c, _ := newTestDeployer(t, cfg)
 	s3c.failCreate[cfg.WebBucket] = errors.New("boom")
-
-	d := newWith(cfg, ddb, s3c)
 	actions, err := d.Apply(context.Background())
 	if err == nil {
 		t.Fatal("want an error")
@@ -247,17 +252,15 @@ func TestApplyStopsAtFirstFailureAndReportsProgress(t *testing.T) {
 
 // A dry run reports the plan and touches nothing.
 func TestDryRunMutatesNothing(t *testing.T) {
-	ddb := newFakeDynamo()
-	s3c := newFakeS3()
-	d := newWith(mustValidate(t, testConfig()), ddb, s3c)
+	d, ddb, s3c, _ := newTestDeployer(t, testConfig())
 	d.DryRun = true
 
 	actions, err := d.Apply(context.Background())
 	if err != nil {
 		t.Fatalf("Apply: %v", err)
 	}
-	if len(actions) != 3 {
-		t.Fatalf("got %d actions, want 3", len(actions))
+	if len(actions) != resourceCount {
+		t.Fatalf("got %d actions, want %d", len(actions), resourceCount)
 	}
 	for _, a := range actions {
 		if a.Op != OpPlan {
