@@ -130,7 +130,8 @@ internal/webapi/        the HTTP surface the page talks to
 internal/export/        opt-in presigned download of your own saved values
 worker/                 the nnsight worker (the one Python boundary)
 web/                    the static SPA (S3 + CloudFront)
-deploy/terraform/       IaC for the ~$0 control plane
+internal/deploy/        `foray deploy` — provisions the ~$0 control plane (primary)
+deploy/terraform/       the same control plane as IaC (alternate path)
 ARCHITECTURE.md         the full design
 CLAUDE.md               the working contract / invariants
 ```

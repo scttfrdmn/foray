@@ -168,14 +168,23 @@ bundle-truffle:
 	  $(GO) build -ldflags "-s -w" -o $(CURDIR)/$(BUILD)/foray-web/bin/truffle ./
 	@echo "==> bundled truffle: $$(file $(BUILD)/foray-web/bin/truffle | cut -d: -f2-)"
 
-## deploy: IaC up (S3+CloudFront, API GW+Lambda, IAM, Cedar embedded, DDB)
+## deploy-fake: rehearse `foray deploy` offline (FORAY_FAKE, no AWS) — CI gate
+.PHONY: deploy-fake
+deploy-fake:
+	@echo "==> deploy-fake: walking foray deploy/teardown with FORAY_FAKE=1 (no AWS)"
+	FORAY_FAKE=1 $(GO) run ./cmd/foray deploy
+	FORAY_FAKE=1 $(GO) run ./cmd/foray teardown --force
+
+## deploy: IaC up via Terraform (S3+CloudFront, API GW+Lambda, IAM, Cedar embedded, DDB).
+## Still the complete path; `foray deploy` (issue #85) is taking over incrementally
+## and covers storage + session state so far.
 .PHONY: deploy
 deploy: deploy-check lambdas
 	cd $(TF_DIR) && terraform init && terraform apply -var-file=$(TF_VARS)
 	aws s3 sync web/ "s3://$$(cd $(TF_DIR) && terraform output -raw web_bucket)/" --delete
 	@echo "==> deployed. page: $$(cd $(TF_DIR) && terraform output -raw cloudfront_domain)"
 
-## teardown: IaC down — leave nothing running, nothing billing
+## teardown: IaC down via Terraform — leave nothing running, nothing billing
 .PHONY: teardown
 teardown:
 	-aws s3 rm "s3://$$(cd $(TF_DIR) && terraform output -raw web_bucket)/" --recursive 2>/dev/null

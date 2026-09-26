@@ -1,7 +1,29 @@
 <!--
 Copyright 2026 Scott Friedman. Apache License 2.0.
 -->
-# foray control plane — Terraform
+# foray control plane — Terraform (the alternate path)
+
+> [!NOTE]
+> **`foray deploy` is the primary deployment path** (issue #85). It provisions the
+> same control plane directly through the AWS SDK, so Terraform is not a
+> prerequisite — which matters for a tool whose pitch is "all you need is an AWS
+> account". This directory remains the **documented alternate** for anyone who
+> wants declarative infra, and it is still the *complete* path while the verb takes
+> over incrementally (storage + session state so far).
+>
+> Same decision, same shape as **lagotto**, the spore.host tool in this position:
+> a `deploy` verb as the primary path, declarative templates as the alternate.
+>
+> ```bash
+> foray deploy --dry-run     # what it would create
+> foray deploy               # apply
+> foray teardown             # remove it (confirms first — it empties the data bucket)
+> FORAY_FAKE=1 foray deploy  # rehearse offline; `make deploy-fake` does both halves
+> ```
+>
+> Both paths tag every resource `Project=foray`, so `make teardown-verify` checks
+> either one.
+
 
 The ~$0 control plane (ARCHITECTURE.md §2): a static SPA in S3 + CloudFront, two
 cold Lambdas wrapping the existing `http.Handler`s, an on-demand DynamoDB table,

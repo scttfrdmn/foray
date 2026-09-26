@@ -11,6 +11,53 @@ prefix.
 
 ## [Unreleased]
 
+### Added
+
+- **`foray deploy` / `foray teardown` — the primary deployment path (#85, first
+  increment).** `internal/deploy` provisions the control plane directly through
+  the AWS SDK, so Terraform stops being a prerequisite for "all you need is an AWS
+  account". `deploy/terraform/` remains the documented alternate and is still the
+  complete path; the verb is taking over incrementally and covers **storage and
+  session state** so far (DynamoDB sessions table, both S3 buckets). Lambda +
+  API Gateway, IAM, and CloudFront + web sync follow. Shape borrowed from lagotto,
+  the spore.host tool in the same position.
+  - **No state file, so everything is discovered before it is created.** `Apply` is
+    re-runnable by construction — which matters more here than for Terraform, since
+    without state a half-finished deploy can only be fixed by running it again.
+    `Apply` stops at the first failure (later resources depend on earlier ones) and
+    returns what it completed, because there is nothing else for the caller to
+    consult.
+  - **`Teardown` does not stop at the first failure**, since the requirement is
+    that nothing is left billing — one stubborn resource must not shield the rest.
+    It empties buckets before deleting them (S3 refuses otherwise, and stored bytes
+    bill), and surfaces `DeleteObjects` per-key failures, which the API reports in
+    a 200 body.
+  - Every resource carries `Project=foray`, which `scripts/teardown-verify.sh`
+    asserts on. Terraform got this from `default_tags`; here it is per-call, and an
+    untagged resource is the one way this can fail silently — so a test pins it.
+  - `--dry-run` reports the plan and calls no mutating API. `FORAY_FAKE=1` walks the
+    real resource list and ordering over in-memory AWS stand-ins, so `make
+    deploy-fake` (new, and a new CI gate) rehearses deploy *and* teardown offline.
+  - `foray teardown` names what is irreversible before asking — emptying the data
+    bucket destroys saved activations the user cannot regenerate — and inherits
+    #87's refusal to read an unanswerable prompt as consent, so a non-tty teardown
+    declines rather than wiping the bucket.
+  - Handles the S3 edges that bite: the `LocationConstraint` must be sent for every
+    region *except* us-east-1 (an error there, and silently wrong elsewhere);
+    `BucketAlreadyOwnedByYou` is idempotent success while `BucketAlreadyExists` and
+    a 403 from `HeadBucket` mean the global name is taken and say so. The
+    export-bundle lifecycle rule filters on the **tag**, never a prefix — a prefix
+    rule over `sessions/` would expire the user's saves.
+
+- CI: **`scripts/invariant-check.sh` now also scans `internal/deploy/`** (#31).
+  The always-on gate previously looked only at `deploy/terraform/`, so moving
+  provisioning into Go would have made it half-blind. It now denies hourly-billing
+  service clients (RDS, ECS/EKS, ElastiCache, MSK, load balancers, …) and calls
+  (`RunInstances`, `CreateNatGateway`, `CreateDBInstance`, …) in the deploy package,
+  and asserts `CreateTable` uses `BillingModePayPerRequest` — the same rule the
+  `.tf` files carry. Each of the three new checks was verified to fail on an
+  injected violation.
+
 ### Changed
 
 - **foray now terminates a session's instance when the rung ends** (#80), which is

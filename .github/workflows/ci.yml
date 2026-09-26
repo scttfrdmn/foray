@@ -70,6 +70,9 @@ jobs:
         with:
           go-version: "1.26"
       - run: make demo-fake
+      # The deploy verb (#85) walks its real resource list, ordering and
+      # idempotency rules over in-memory AWS stand-ins — no account, no cost.
+      - run: make deploy-fake
 
   worker-test:
     name: worker pytest (no GPU, no AWS)
