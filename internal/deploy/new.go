@@ -19,6 +19,7 @@ import (
 	"fmt"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/apigatewayv2"
 	cwl "github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/iam"
@@ -61,6 +62,7 @@ func New(ctx context.Context, cfg Config, awsCfg aws.Config) (*Deployer, error) 
 		iam.NewFromConfig(awsCfg),
 		lam,
 		cwl.NewFromConfig(awsCfg),
+		apigatewayv2.NewFromConfig(awsCfg),
 	), nil
 }
 
@@ -79,8 +81,8 @@ func New(ctx context.Context, cfg Config, awsCfg aws.Config) (*Deployer, error) 
 // by reading the created resources, so ordering here is about what must exist
 // before something can be used — not about what must exist before a policy can be
 // written.
-func newWith(cfg Config, ddb dynamoAPI, s3c s3DeployAPI, iamc iamAPI, lam lambdaAPI, logs logsAPI) *Deployer {
-	return newWithZips(cfg, ddb, s3c, iamc, lam, logs, nil)
+func newWith(cfg Config, ddb dynamoAPI, s3c s3DeployAPI, iamc iamAPI, lam lambdaFullAPI, logs logsAPI, apigw apigwAPI) *Deployer {
+	return newWithZips(cfg, ddb, s3c, iamc, lam, logs, apigw, nil)
 }
 
 // withZipReader installs a package loader, or leaves the default (os.ReadFile).
@@ -93,7 +95,7 @@ func withZipReader(f *lambdaFunc, read func(string) ([]byte, error)) *lambdaFunc
 
 // newWithZips is newWith with an injectable deployment-package loader, so the
 // rehearsal and the tests do not need `make lambdas` to have run.
-func newWithZips(cfg Config, ddb dynamoAPI, s3c s3DeployAPI, iamc iamAPI, lam lambdaAPI, logs logsAPI, readZip func(string) ([]byte, error)) *Deployer {
+func newWithZips(cfg Config, ddb dynamoAPI, s3c s3DeployAPI, iamc iamAPI, lam lambdaFullAPI, logs logsAPI, apigw apigwAPI, readZip func(string) ([]byte, error)) *Deployer {
 	tableARN := sessionsTableARN(cfg.Region, cfg.AccountID, cfg.SessionsTable)
 	logGroupFor := func(name string) *logGroup {
 		return &logGroup{
@@ -144,6 +146,17 @@ func newWithZips(cfg Config, ddb dynamoAPI, s3c s3DeployAPI, iamc iamAPI, lam la
 			// The functions assume the IAM roles above, which is why they come after.
 			withZipReader(gatewayFunction(lam, cfg, cfg.LWALayerARN), readZip),
 			withZipReader(webAPIFunction(lam, cfg, cfg.LWALayerARN), readZip),
+
+			// The API's access-log group, then the API itself. The API is last because
+			// it fronts everything above it: its routes target the functions, and its
+			// invoke permissions are written onto them.
+			logGroupFor(apigwLogGroup),
+			forayHTTPAPI(apigw, lam, cfg, logGroupARNOf(cfg, apigwLogGroup)),
 		},
 	}
+}
+
+// logGroupARNOf builds a log group's ARN for the API stage's access-log destination.
+func logGroupARNOf(cfg Config, group string) string {
+	return fmt.Sprintf("arn:%s:logs:%s:%s:log-group:%s", partition, cfg.Region, cfg.AccountID, group)
 }

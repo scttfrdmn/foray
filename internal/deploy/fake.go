@@ -18,11 +18,14 @@ import (
 	"context"
 	"time"
 
+	"fmt"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"net/url"
 	"sort"
 	"strings"
 
+	"github.com/aws/aws-sdk-go-v2/service/apigatewayv2"
+	apitypes "github.com/aws/aws-sdk-go-v2/service/apigatewayv2/types"
 	cwl "github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs"
 	cwltypes "github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs/types"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
@@ -293,7 +296,7 @@ func NewFake(cfg Config) (*Deployer, error) {
 	}
 	// The rehearsal has no built zips, so hand the Lambdas canned bytes.
 	fakeZip := func(path string) ([]byte, error) { return []byte("fake-zip:" + path), nil }
-	return newWithZips(cfg, newFakeDynamo(), newFakeS3(), newFakeIAM(), newFakeLambda(), newFakeLogs(), fakeZip), nil
+	return newWithZips(cfg, newFakeDynamo(), newFakeS3(), newFakeIAM(), newFakeLambda(), newFakeLogs(), newFakeAPIGW(), fakeZip), nil
 }
 
 // --- IAM --------------------------------------------------------------------
@@ -540,6 +543,8 @@ type fakeFunction struct {
 	runtime    lambdatypes.Runtime
 	tags       map[string]string
 	codeUpdate int // how many times the code was republished
+	// permissions is the function's resource policy: statement id → SourceArn.
+	permissions map[string]string
 }
 
 type fakeLambda struct {
@@ -619,15 +624,16 @@ func (f *fakeLambda) CreateFunction(_ context.Context, in *lambda.CreateFunction
 		tags[k] = v
 	}
 	f.functions[name] = &fakeFunction{
-		roleARN:  aws.ToString(in.Role),
-		codeSHA:  zipSHA256(in.Code.ZipFile),
-		layers:   in.Layers,
-		env:      env,
-		timeout:  aws.ToInt32(in.Timeout),
-		memoryMB: aws.ToInt32(in.MemorySize),
-		arch:     in.Architectures,
-		runtime:  in.Runtime,
-		tags:     tags,
+		roleARN:     aws.ToString(in.Role),
+		codeSHA:     zipSHA256(in.Code.ZipFile),
+		layers:      in.Layers,
+		env:         env,
+		timeout:     aws.ToInt32(in.Timeout),
+		memoryMB:    aws.ToInt32(in.MemorySize),
+		arch:        in.Architectures,
+		runtime:     in.Runtime,
+		tags:        tags,
+		permissions: map[string]string{},
 	}
 	return &lambda.CreateFunctionOutput{}, nil
 }
@@ -746,4 +752,260 @@ func (f *fakeLogs) TagResource(_ context.Context, in *cwl.TagResourceInput, _ ..
 		return nil, f.tagErr
 	}
 	return &cwl.TagResourceOutput{}, nil
+}
+
+// --- Lambda resource policy -------------------------------------------------
+
+// permissions on fakeLambda model the function resource policy the HTTP API writes.
+func (f *fakeLambda) AddPermission(_ context.Context, in *lambda.AddPermissionInput, _ ...func(*lambda.Options)) (*lambda.AddPermissionOutput, error) {
+	name := aws.ToString(in.FunctionName)
+	fn, ok := f.functions[name]
+	if !ok {
+		return nil, &lambdatypes.ResourceNotFoundException{Message: aws.String("no such function")}
+	}
+	sid := aws.ToString(in.StatementId)
+	if _, exists := fn.permissions[sid]; exists {
+		// The real API rejects a duplicate statement id, which is the normal case on
+		// re-apply since the id is fixed.
+		return nil, &lambdatypes.ResourceConflictException{Message: aws.String("statement already exists")}
+	}
+	fn.permissions[sid] = aws.ToString(in.SourceArn)
+	return &lambda.AddPermissionOutput{}, nil
+}
+
+func (f *fakeLambda) RemovePermission(_ context.Context, in *lambda.RemovePermissionInput, _ ...func(*lambda.Options)) (*lambda.RemovePermissionOutput, error) {
+	fn, ok := f.functions[aws.ToString(in.FunctionName)]
+	if !ok {
+		return nil, &lambdatypes.ResourceNotFoundException{Message: aws.String("no such function")}
+	}
+	sid := aws.ToString(in.StatementId)
+	if _, exists := fn.permissions[sid]; !exists {
+		return nil, &lambdatypes.ResourceNotFoundException{Message: aws.String("no such statement")}
+	}
+	delete(fn.permissions, sid)
+	return &lambda.RemovePermissionOutput{}, nil
+}
+
+// --- API Gateway v2 ---------------------------------------------------------
+
+type fakeIntegration struct {
+	id            string
+	uri           string
+	integType     apitypes.IntegrationType
+	method        string
+	payloadFormat string
+}
+
+type fakeRoute struct {
+	id     string
+	key    string
+	target string
+}
+
+type fakeStage struct {
+	autoDeploy bool
+	logARN     string
+	logFormat  string
+}
+
+type fakeAPI struct {
+	id           string
+	name         string
+	protocol     apitypes.ProtocolType
+	tags         map[string]string
+	integrations map[string]*fakeIntegration // by id
+	routes       map[string]*fakeRoute       // by route key
+	stages       map[string]*fakeStage
+}
+
+type fakeAPIGW struct {
+	apis map[string]*fakeAPI // by id
+	seq  int
+}
+
+func newFakeAPIGW() *fakeAPIGW { return &fakeAPIGW{apis: map[string]*fakeAPI{}} }
+
+// nextID mimics API Gateway's generated ids — the reason httpAPI owns everything
+// that needs one rather than constructing it.
+func (f *fakeAPIGW) nextID(prefix string) string {
+	f.seq++
+	return fmt.Sprintf("%s%04d", prefix, f.seq)
+}
+
+func (f *fakeAPIGW) GetApis(_ context.Context, _ *apigatewayv2.GetApisInput, _ ...func(*apigatewayv2.Options)) (*apigatewayv2.GetApisOutput, error) {
+	out := &apigatewayv2.GetApisOutput{}
+	ids := make([]string, 0, len(f.apis))
+	for id := range f.apis {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	for _, id := range ids {
+		a := f.apis[id]
+		out.Items = append(out.Items, apitypes.Api{ApiId: aws.String(a.id), Name: aws.String(a.name)})
+	}
+	return out, nil
+}
+
+func (f *fakeAPIGW) CreateApi(_ context.Context, in *apigatewayv2.CreateApiInput, _ ...func(*apigatewayv2.Options)) (*apigatewayv2.CreateApiOutput, error) {
+	id := f.nextID("api")
+	tags := map[string]string{}
+	for k, v := range in.Tags {
+		tags[k] = v
+	}
+	f.apis[id] = &fakeAPI{
+		id:           id,
+		name:         aws.ToString(in.Name),
+		protocol:     in.ProtocolType,
+		tags:         tags,
+		integrations: map[string]*fakeIntegration{},
+		routes:       map[string]*fakeRoute{},
+		stages:       map[string]*fakeStage{},
+	}
+	return &apigatewayv2.CreateApiOutput{ApiId: aws.String(id), Name: in.Name}, nil
+}
+
+// DeleteApi cascades to integrations, routes and stages, as the real API does.
+func (f *fakeAPIGW) DeleteApi(_ context.Context, in *apigatewayv2.DeleteApiInput, _ ...func(*apigatewayv2.Options)) (*apigatewayv2.DeleteApiOutput, error) {
+	delete(f.apis, aws.ToString(in.ApiId))
+	return &apigatewayv2.DeleteApiOutput{}, nil
+}
+
+func (f *fakeAPIGW) GetIntegrations(_ context.Context, in *apigatewayv2.GetIntegrationsInput, _ ...func(*apigatewayv2.Options)) (*apigatewayv2.GetIntegrationsOutput, error) {
+	a, ok := f.apis[aws.ToString(in.ApiId)]
+	if !ok {
+		return nil, &apitypes.NotFoundException{Message: aws.String("no such api")}
+	}
+	out := &apigatewayv2.GetIntegrationsOutput{}
+	ids := make([]string, 0, len(a.integrations))
+	for id := range a.integrations {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	for _, id := range ids {
+		it := a.integrations[id]
+		out.Items = append(out.Items, apitypes.Integration{
+			IntegrationId:  aws.String(it.id),
+			IntegrationUri: aws.String(it.uri),
+		})
+	}
+	return out, nil
+}
+
+func (f *fakeAPIGW) CreateIntegration(_ context.Context, in *apigatewayv2.CreateIntegrationInput, _ ...func(*apigatewayv2.Options)) (*apigatewayv2.CreateIntegrationOutput, error) {
+	a, ok := f.apis[aws.ToString(in.ApiId)]
+	if !ok {
+		return nil, &apitypes.NotFoundException{Message: aws.String("no such api")}
+	}
+	id := f.nextID("int")
+	a.integrations[id] = &fakeIntegration{
+		id:            id,
+		uri:           aws.ToString(in.IntegrationUri),
+		integType:     in.IntegrationType,
+		method:        aws.ToString(in.IntegrationMethod),
+		payloadFormat: aws.ToString(in.PayloadFormatVersion),
+	}
+	return &apigatewayv2.CreateIntegrationOutput{IntegrationId: aws.String(id)}, nil
+}
+
+func (f *fakeAPIGW) GetRoutes(_ context.Context, in *apigatewayv2.GetRoutesInput, _ ...func(*apigatewayv2.Options)) (*apigatewayv2.GetRoutesOutput, error) {
+	a, ok := f.apis[aws.ToString(in.ApiId)]
+	if !ok {
+		return nil, &apitypes.NotFoundException{Message: aws.String("no such api")}
+	}
+	out := &apigatewayv2.GetRoutesOutput{}
+	keys := make([]string, 0, len(a.routes))
+	for k := range a.routes {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		r := a.routes[k]
+		out.Items = append(out.Items, apitypes.Route{
+			RouteId:  aws.String(r.id),
+			RouteKey: aws.String(r.key),
+			Target:   aws.String(r.target),
+		})
+	}
+	return out, nil
+}
+
+func (f *fakeAPIGW) CreateRoute(_ context.Context, in *apigatewayv2.CreateRouteInput, _ ...func(*apigatewayv2.Options)) (*apigatewayv2.CreateRouteOutput, error) {
+	a, ok := f.apis[aws.ToString(in.ApiId)]
+	if !ok {
+		return nil, &apitypes.NotFoundException{Message: aws.String("no such api")}
+	}
+	id := f.nextID("rte")
+	a.routes[aws.ToString(in.RouteKey)] = &fakeRoute{
+		id:     id,
+		key:    aws.ToString(in.RouteKey),
+		target: aws.ToString(in.Target),
+	}
+	return &apigatewayv2.CreateRouteOutput{RouteId: aws.String(id)}, nil
+}
+
+func (f *fakeAPIGW) UpdateRoute(_ context.Context, in *apigatewayv2.UpdateRouteInput, _ ...func(*apigatewayv2.Options)) (*apigatewayv2.UpdateRouteOutput, error) {
+	a, ok := f.apis[aws.ToString(in.ApiId)]
+	if !ok {
+		return nil, &apitypes.NotFoundException{Message: aws.String("no such api")}
+	}
+	if r, ok := a.routes[aws.ToString(in.RouteKey)]; ok {
+		r.target = aws.ToString(in.Target)
+	}
+	return &apigatewayv2.UpdateRouteOutput{}, nil
+}
+
+func (f *fakeAPIGW) GetStage(_ context.Context, in *apigatewayv2.GetStageInput, _ ...func(*apigatewayv2.Options)) (*apigatewayv2.GetStageOutput, error) {
+	a, ok := f.apis[aws.ToString(in.ApiId)]
+	if !ok {
+		return nil, &apitypes.NotFoundException{Message: aws.String("no such api")}
+	}
+	s, ok := a.stages[aws.ToString(in.StageName)]
+	if !ok {
+		return nil, &apitypes.NotFoundException{Message: aws.String("no such stage")}
+	}
+	return &apigatewayv2.GetStageOutput{
+		StageName:  in.StageName,
+		AutoDeploy: aws.Bool(s.autoDeploy),
+	}, nil
+}
+
+func (f *fakeAPIGW) CreateStage(_ context.Context, in *apigatewayv2.CreateStageInput, _ ...func(*apigatewayv2.Options)) (*apigatewayv2.CreateStageOutput, error) {
+	a, ok := f.apis[aws.ToString(in.ApiId)]
+	if !ok {
+		return nil, &apitypes.NotFoundException{Message: aws.String("no such api")}
+	}
+	s := &fakeStage{autoDeploy: aws.ToBool(in.AutoDeploy)}
+	if in.AccessLogSettings != nil {
+		s.logARN = aws.ToString(in.AccessLogSettings.DestinationArn)
+		s.logFormat = aws.ToString(in.AccessLogSettings.Format)
+	}
+	a.stages[aws.ToString(in.StageName)] = s
+	return &apigatewayv2.CreateStageOutput{}, nil
+}
+
+func (f *fakeAPIGW) UpdateStage(_ context.Context, in *apigatewayv2.UpdateStageInput, _ ...func(*apigatewayv2.Options)) (*apigatewayv2.UpdateStageOutput, error) {
+	a, ok := f.apis[aws.ToString(in.ApiId)]
+	if !ok {
+		return nil, &apitypes.NotFoundException{Message: aws.String("no such api")}
+	}
+	s, ok := a.stages[aws.ToString(in.StageName)]
+	if !ok {
+		return nil, &apitypes.NotFoundException{Message: aws.String("no such stage")}
+	}
+	s.autoDeploy = aws.ToBool(in.AutoDeploy)
+	if in.AccessLogSettings != nil {
+		s.logARN = aws.ToString(in.AccessLogSettings.DestinationArn)
+		s.logFormat = aws.ToString(in.AccessLogSettings.Format)
+	}
+	return &apigatewayv2.UpdateStageOutput{}, nil
+}
+
+// apiByName finds a fake API by name, for tests.
+func (f *fakeAPIGW) apiByName(name string) *fakeAPI {
+	for _, a := range f.apis {
+		if a.name == name {
+			return a
+		}
+	}
+	return nil
 }

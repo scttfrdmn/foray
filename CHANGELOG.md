@@ -13,6 +13,39 @@ prefix.
 
 ### Added
 
+- **`foray deploy`: the HTTP API — routes, `$default` stage and Lambda invoke
+  permissions (#85, increment 3b).** Completes the request path: CloudFront aside,
+  the deployed control plane can now serve.
+  - Three routes matching `api.tf`: `ANY /sessions/{proxy+}` → the gateway,
+    `ANY /api/{proxy+}` and `GET /healthz` → the web API. One integration per
+    *function* rather than per route, so `/api/*` and `/healthz` share the web API's.
+    A route pointing at a stale integration is retargeted rather than left — that
+    failure deploys cleanly and then 404s every request from a function that has
+    never heard of the path.
+  - **The API is one resource, not several.** Its id is *generated*, unlike every
+    other resource here whose identity is constructed from the config — so the unit
+    that owns the id owns everything needing it (integrations, routes, stage,
+    permissions) rather than threading discovered state between resources.
+    Integrations are matched by their target function ARN and routes by route key,
+    since those are the only stable identities they have.
+  - **Invoke permissions are scoped to this API's execution ARN** (`/*/*`).
+    Granting `apigateway.amazonaws.com` without a `SourceArn` would let any API in
+    any account invoke the functions. The statement id is fixed so a re-apply
+    converges one statement instead of accumulating them, and teardown removes them
+    explicitly — they live on the *functions*, so deleting the API alone would
+    strand them.
+  - `$default` stage with `AutoDeploy`: the stage-less path is what lets CloudFront
+    forward `/api/*` straight through, and without auto-deploy a newly added route
+    404s with nothing explaining why. Access logging captures
+    `$context.integrationErrorMessage` — the field that reports "the Lambda never
+    became ready", which was invisible in #64.
+  - API Gateway does not enforce unique names, so two APIs named `foray` are
+    *reported* rather than guessed between; silently picking one would have
+    successive deploys converge different APIs.
+  - Adds `service/apigatewayv2`. The drift guard now covers `api.tf` (route keys,
+    stage, payload format, integration type, log group, the access-log field) and the
+    invoke permission's statement id and principal.
+
 - **`foray deploy`: the two Lambda functions, their log groups, and automatic
   Lambda Web Adapter layer resolution (#85, third increment).**
   - **The LWA layer ARN is now resolved at deploy time** instead of pasted into a

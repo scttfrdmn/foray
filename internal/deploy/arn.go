@@ -69,3 +69,14 @@ func instanceARN(accountID string) string {
 // CloudWatch log group. Using the managed policy rather than hand-writing logs:*
 // keeps it correct as AWS evolves it.
 const lambdaBasicExecutionPolicyARN = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+
+func functionARN(region, accountID, funcName string) string {
+	return fmt.Sprintf("arn:%s:lambda:%s:%s:function:%s", partition, region, accountID, funcName)
+}
+
+// executionARN is the API's invoke-permission scope. Note the service is
+// `execute-api`, not `apigateway` — the latter names the control plane, and a
+// permission scoped to it would never match an actual request.
+func executionARN(region, accountID, apiID string) string {
+	return fmt.Sprintf("arn:%s:execute-api:%s:%s:%s", partition, region, accountID, apiID)
+}
