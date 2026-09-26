@@ -17,6 +17,7 @@ package deploy
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -233,17 +234,64 @@ func TestMissingZipSaysHowToBuildIt(t *testing.T) {
 
 // The whole point of resolving: a hand-pinned, region-specific ARN was the friction
 // Terraform imposed, and a wrong one is a silent 503.
+//
+// Versions cannot be enumerated (a public layer grants only GetLayerVersion), so this
+// searches — and the search must land on the NEWEST version, not merely an existing
+// one.
 func TestResolveLWALayerARN(t *testing.T) {
-	f := newFakeLambda()
-	f.layerVersions = []string{"25", "24"} // newest first, as the API returns them
+	for _, latest := range []int32{1, 2, 25, 30, 31, 64, 100} {
+		f := newFakeLambda()
+		f.latestLayerVersion = latest
 
-	arn, err := resolveLWALayerARN(context.Background(), f, "us-west-2")
-	if err != nil {
+		arn, err := resolveLWALayerARN(context.Background(), f, "us-west-2")
+		if err != nil {
+			t.Fatalf("latest=%d: resolve: %v", latest, err)
+		}
+		want := fmt.Sprintf("arn:aws:lambda:us-west-2:%s:layer:%s:%d",
+			lwaPublisherAccount, lwaLayerNameArm64, latest)
+		if arn != want {
+			t.Errorf("latest=%d: arn = %q, want %q", latest, arn, want)
+		}
+	}
+}
+
+// The search must stay cheap: doubling then binary-searching is ~2·log2(n) calls, so
+// a linear scan creeping back in would show up here.
+func TestResolveLWALayerSearchIsLogarithmic(t *testing.T) {
+	f := newFakeLambda()
+	f.latestLayerVersion = 30
+	if _, err := resolveLWALayerARN(context.Background(), f, "us-west-2"); err != nil {
 		t.Fatalf("resolve: %v", err)
 	}
-	want := "arn:aws:lambda:us-west-2:" + lwaPublisherAccount + ":layer:" + lwaLayerNameArm64 + ":25"
-	if arn != want {
-		t.Errorf("arn = %q, want %q", arn, want)
+	// 1 verify + 5 doubling + ~4 bisect. 20 is generous headroom; 30+ would mean a
+	// linear scan.
+	if f.layerProbes > 20 {
+		t.Errorf("used %d probes for version 30, want a logarithmic search (<=20)", f.layerProbes)
+	}
+}
+
+// An unpublished version answers AccessDenied, NOT NotFound, because the layer's
+// resource policy is per-version. Reading that as a hard failure is what broke the
+// first implementation against a real account.
+func TestResolveLWALayerTreatsAccessDeniedAsAbsent(t *testing.T) {
+	f := newFakeLambda()
+	f.latestLayerVersion = 30
+	arn, err := resolveLWALayerARN(context.Background(), f, "us-west-2")
+	if err != nil {
+		t.Fatalf("AccessDenied on an unpublished version must mean absent, not fatal: %v", err)
+	}
+	if !strings.HasSuffix(arn, ":30") {
+		t.Errorf("arn = %q, want the newest version", arn)
+	}
+}
+
+// A throttle or network failure must NOT be read as "absent" — that would silently
+// resolve an older version, or none.
+func TestResolveLWALayerPropagatesRealErrors(t *testing.T) {
+	f := newFakeLambda()
+	f.layerErr = errors.New("ThrottlingException: rate exceeded")
+	if _, err := resolveLWALayerARN(context.Background(), f, "us-west-2"); err == nil {
+		t.Fatal("want a throttle surfaced, not treated as an absent version")
 	}
 }
 
@@ -269,8 +317,8 @@ func TestResolveLWALayerErrorsMentionTheOverride(t *testing.T) {
 		name  string
 		setup func(*fakeLambda)
 	}{
-		{"api error", func(f *fakeLambda) { f.layerErr = errors.New("access denied") }},
-		{"no versions published", func(f *fakeLambda) { f.layerVersions = nil }},
+		{"api error", func(f *fakeLambda) { f.layerErr = errors.New("boom") }},
+		{"layer not published in this region", func(f *fakeLambda) { f.latestLayerVersion = 0 }},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
