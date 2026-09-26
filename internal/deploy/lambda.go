@@ -40,6 +40,15 @@ type lambdaAPI interface {
 	TagResource(ctx context.Context, in *lambda.TagResourceInput, opts ...func(*lambda.Options)) (*lambda.TagResourceOutput, error)
 }
 
+// lambdaFullAPI is everything this package asks of Lambda: managing the functions
+// (lambdaAPI) and writing the resource-policy grants the HTTP API needs
+// (lambdaPermAPI). One client satisfies both; the interfaces stay split so each
+// resource declares only what it uses.
+type lambdaFullAPI interface {
+	lambdaAPI
+	lambdaPermAPI
+}
+
 // Function names and the ports each binary listens on.
 //
 // The ports are the load-bearing detail. `cmd/forayd` binds :8080 and

@@ -209,3 +209,54 @@ func TestLogGroupNamesMatchTerraform(t *testing.T) {
 		}
 	}
 }
+
+const apiTerraformPath = "../../deploy/terraform/api.tf"
+
+// The API's shape must match the Terraform path. The route keys especially: a path
+// served by one path and not the other means the page or the CLI works only when the
+// control plane was deployed a particular way.
+func TestAPIShapeMatchesTerraform(t *testing.T) {
+	b, err := os.ReadFile(apiTerraformPath)
+	if err != nil {
+		t.Fatalf("read %s: %v", apiTerraformPath, err)
+	}
+	tf := string(b)
+
+	tests := []struct {
+		what string
+		want string
+	}{
+		{"api name", `"` + APIName + `"`},
+		{"trace route", RouteTrace},
+		{"api route", RouteAPI},
+		{"healthz route", RouteHealthz},
+		{"default stage", StageDefault},
+		{"payload format 2.0", `"2.0"`},
+		{"AWS_PROXY integration", "AWS_PROXY"},
+		{"apigw log group", apigwLogGroup},
+		{"integrationErrorMessage in access logs", "integrationErrorMessage"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.what, func(t *testing.T) {
+			if !strings.Contains(tf, tt.want) {
+				t.Errorf("%s (%q) is not in deploy/terraform/api.tf — the two paths have drifted", tt.what, tt.want)
+			}
+		})
+	}
+}
+
+// The invoke permission's statement id and principal must match, so a stack deployed
+// one way and re-deployed the other converges one statement rather than accumulating
+// two.
+func TestInvokePermissionMatchesTerraform(t *testing.T) {
+	b, err := os.ReadFile(lambdaTerraformPath)
+	if err != nil {
+		t.Fatalf("read %s: %v", lambdaTerraformPath, err)
+	}
+	tf := string(b)
+	for _, want := range []string{invokePermissionID, "apigateway.amazonaws.com", "lambda:InvokeFunction"} {
+		if !strings.Contains(tf, want) {
+			t.Errorf("%q is not in deploy/terraform/lambda.tf — the paths would write different policy statements", want)
+		}
+	}
+}

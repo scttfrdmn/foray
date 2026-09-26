@@ -31,35 +31,37 @@ func testConfig() Config {
 }
 
 // resourceCount is how many resources a full Apply touches: the sessions table, two
-// buckets, three IAM roles, the spawn instance profile, two log groups and two
-// Lambda functions.
-const resourceCount = 11
+// buckets, three IAM roles, the spawn instance profile, three log groups, two Lambda
+// functions and the HTTP API.
+const resourceCount = 13
 
 // testFakes bundles the stand-ins so tests can reach whichever they assert on.
 type testFakes struct {
-	ddb  *fakeDynamo
-	s3   *fakeS3
-	iam  *fakeIAM
-	lam  *fakeLambda
-	logs *fakeLogs
+	ddb   *fakeDynamo
+	s3    *fakeS3
+	iam   *fakeIAM
+	lam   *fakeLambda
+	logs  *fakeLogs
+	apigw *fakeAPIGW
 }
 
 // newTestDeployer builds the real resource list over fakes.
 func newTestDeployer(t *testing.T, cfg Config) (*Deployer, *testFakes) {
 	t.Helper()
 	f := &testFakes{
-		ddb:  newFakeDynamo(),
-		s3:   newFakeS3(),
-		iam:  newFakeIAM(),
-		lam:  newFakeLambda(),
-		logs: newFakeLogs(),
+		ddb:   newFakeDynamo(),
+		s3:    newFakeS3(),
+		iam:   newFakeIAM(),
+		lam:   newFakeLambda(),
+		logs:  newFakeLogs(),
+		apigw: newFakeAPIGW(),
 	}
 	cfg = mustValidate(t, cfg)
 	if cfg.LWALayerARN == "" {
 		cfg.LWALayerARN = lwaLayerBase(cfg.Region) + ":25"
 	}
 	zip := func(path string) ([]byte, error) { return []byte("zip:" + path), nil }
-	d := newWithZips(cfg, f.ddb, f.s3, f.iam, f.lam, f.logs, zip)
+	d := newWithZips(cfg, f.ddb, f.s3, f.iam, f.lam, f.logs, f.apigw, zip)
 	return d, f
 }
 
