@@ -13,6 +13,38 @@ prefix.
 
 ### Added
 
+- **`foray deploy`: the three IAM roles and the spawn instance profile (#85,
+  second increment).** Mirrors `deploy/terraform/iam.tf` statement for statement:
+  - `foray-gateway-lambda` — forayd: the sessions table and nothing else. Four
+    operations, no `Scan` (nothing enumerates — `/healthz` deliberately omits the
+    enumerator capability for this reason) and no `DeleteItem` (rows expire by TTL).
+  - `foray-webapi-lambda` — the page's API: the table, Bedrock to plan, read-only
+    Spot pricing for truffle, the data bucket's `sessions/` prefix to presign
+    exports, and `PassRole` for the spawn role.
+  - `foray-spawn-instance` (+ instance profile) — the GPU: write its saves under
+    `sessions/`, and terminate or stop *itself*.
+  - **Teardown order is load-bearing.** IAM refuses to delete a role that still
+    carries inline or attached policies, and refuses to delete an instance profile
+    still holding a role — so the profile comes off before its role, and both
+    policy sets are *enumerated* (not assumed from our own list) so a role that
+    drifted still tears down cleanly. The fakes model both refusals, and the
+    ordering is asserted on the action sequence rather than the end state.
+  - Adds `service/iam` and `service/sts` (the latter resolves the account id for
+    the policy ARNs, and doubles as an early credential check — a deploy with bad
+    credentials now fails before creating anything).
+  - ARNs are constructed rather than read back, which removes both an API
+    round-trip and a dependency edge. Partition is hardcoded `aws`, matching what
+    `iam.tf` already does.
+
+- **A drift guard between the two deployment paths.** They are maintained in
+  parallel, so `internal/deploy/drift_test.go` compares the *permission surface*
+  against `deploy/terraform/iam.tf` in both directions: an action granted only in
+  Go means the alternate path deploys a control plane that cannot do its job, and
+  one granted only in Terraform means `foray deploy` is under-permissioned (an
+  `AccessDenied` at run time). Role names are checked too — a mismatch would have
+  the two paths create different roles, so a teardown by one leaves the other's
+  behind. Verified to fail in both directions.
+
 - **`foray deploy` / `foray teardown` — the primary deployment path (#85, first
   increment).** `internal/deploy` provisions the control plane directly through
   the AWS SDK, so Terraform stops being a prerequisite for "all you need is an AWS
