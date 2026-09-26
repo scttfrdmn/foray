@@ -82,7 +82,7 @@ jobs:
       # uv manages the worker's Python (spore.host house convention; SHA-pinned so
       # Dependabot bumps it deliberately).
       - name: install uv
-        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
           python-version: "3.12"
       # --locked installs exactly worker/uv.lock and fails if the lock is stale, so
