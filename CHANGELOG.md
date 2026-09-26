@@ -11,6 +11,55 @@ prefix.
 
 ## [Unreleased]
 
+### Changed
+
+- **foray now terminates a session's instance when the rung ends** (#80), which is
+  what actually reaches $0. spawn's idle action only *stops* an instance and a
+  stopped instance keeps billing its EBS volumes, so the previous behavior — leave
+  it to idle, then TTL — billed storage for the remainder of the TTL window
+  (~1h55m with the shipped 5m idle / 2h TTL defaults). The control plane knows
+  precisely when a session is done, so it says so.
+  - Termination happens on **every** exit path, including a failed trace: the
+    per-rung work moved into `runRung`, whose `defer`s close the tunnel and then
+    reap the instance. This matters because `runLoop` reports errors through
+    `die()` → `os.Exit`, which runs no defers — previously a failed trace would
+    have leaked a GPU until TTL. Pinned by tests, verified to fail without the
+    cleanup.
+  - New `foray run --keep` leaves each rung's instance up for a session you want
+    to poke at. Idle and TTL remain the backstops for anything that escapes the
+    normal path (a crashed CLI, a lost network), which is why every launch still
+    carries both.
+  - A failed termination is reported, not fatal — the rung's finding is already in
+    hand and TTL still bounds the instance, so the message names the session to
+    clean up rather than discarding the result.
+
+- **Export ownership no longer depends on the instance being alive** (#80).
+  `export.SessionOwner` resolves ownership from the presence of the session's
+  saves under `sessions/<id>/` in the user's own data bucket, replacing a resolver
+  that asked spawn whether the instance still existed. That coupling was backwards:
+  it would have denied export the moment a session ended — and the run output
+  prints `download: foray export <session>` — while liveness was never what
+  ownership meant. Object presence is durable, survives termination, and directly
+  answers the question export asks. Fails closed on a listing error, scopes the
+  listing to the one session prefix with `MaxKeys=1`, and `Exists` is split out so
+  the CLI can say "no saved values found for session X" instead of Cedar's
+  misleading "only the session owner may export". Wired into both `cmd/foray` and
+  `internal/webapi`; the Cedar gate itself is unchanged and still governs the
+  residency case (`allowExport == false`).
+
+### Fixed
+
+- `cmd/foray`: **flags written after the question no longer get silently dropped.**
+  stdlib `flag` stops parsing at the first positional argument, so
+  `foray run "why does it refuse X?" --yes` discarded `--yes` — which is how a
+  person types it, how the README shows it, and how `make demo-fake` invokes it.
+  The gate was passing only because an unreadable stdin happened to read as
+  approval, not because `--yes` took effect (`--yes` now prints `Go (auto)` there,
+  as it always should have). Found while adding `--keep`, which would have been
+  unusable in the position everyone writes flags. `parseWithPositionals` uses the
+  canonical stdlib parse/positional/re-parse loop; table-driven test covers flags
+  before, after, and on both sides of the question.
+
 ### Documentation
 
 - Corrected a claim that was simply false: **spawn's idle action stops an

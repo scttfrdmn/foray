@@ -76,6 +76,37 @@ func main() {
 	}
 }
 
+// parseWithPositionals parses flags that may appear *after* the positional
+// argument, and returns the first positional.
+//
+// stdlib flag stops parsing at the first non-flag argument, so `foray run "why
+// does it refuse X?" --yes` silently dropped every flag after the question — which
+// is how a person naturally types it, how the README shows it, and how
+// `make demo-fake` invokes it. The demo-fake gate was passing only because an
+// unreadable stdin happened to read as approval, not because --yes took effect.
+//
+// The loop below is the canonical stdlib idiom: parse, take the positional it
+// stopped on, parse the remainder, repeat. Cheaper than a dependency and it keeps
+// flag's own error handling.
+func parseWithPositionals(fs *flag.FlagSet, args []string) string {
+	var positional []string
+	rest := args
+	for {
+		if err := fs.Parse(rest); err != nil {
+			return "" // ExitOnError already reported and exited
+		}
+		if fs.NArg() == 0 {
+			break
+		}
+		positional = append(positional, fs.Arg(0))
+		rest = fs.Args()[1:]
+	}
+	if len(positional) == 0 {
+		return ""
+	}
+	return positional[0]
+}
+
 // runCmd plans (or builds, on the expert path) the ladder and walks the loop. The
 // same loop serves the fake and real paths — only how the collaborators are wired
 // differs (buildDeps).
@@ -88,9 +119,9 @@ func runCmd(ctx context.Context, args []string) {
 		hardware  = fs.String("hardware", "", "override instance type, e.g. g7e.xlarge (else the smallest tier)")
 		budget    = fs.Float64("budget", 0, "per-question budget envelope in USD (the ladder is capped here)")
 		yes       = fs.Bool("yes", false, "approve every rung without prompting (pre-authorizes the whole climb)")
+		keep      = fs.Bool("keep", false, "leave each rung's instance running instead of terminating it when the rung ends (idle still stops it, TTL still terminates it)")
 	)
-	_ = fs.Parse(args)
-	question := fs.Arg(0)
+	question := parseWithPositionals(fs, args)
 
 	d, err := buildDeps(*budget)
 	if err != nil {
@@ -125,7 +156,7 @@ func runCmd(ctx context.Context, args []string) {
 			return
 		}
 	}
-	runLoop(ctx, d, ladder, prop, *yes)
+	runLoop(ctx, d, ladder, prop, *yes, *keep)
 }
 
 // runLoop is the result-gated ladder, shared by the fake and real paths:
@@ -133,7 +164,7 @@ func runCmd(ctx context.Context, args []string) {
 // gateway → Interpret → Assess → climb only on a fresh Go. The brain proposes
 // and interprets; only Approve launches; climbing is never automatic and stops
 // on an honest negative (CLAUDE.md invariants).
-func runLoop(ctx context.Context, d *deps, ladder *brain.Ladder, prop *brain.Proposal, yes bool) {
+func runLoop(ctx context.Context, d *deps, ladder *brain.Ladder, prop *brain.Proposal, yes, keep bool) {
 	fmt.Printf("\n  question: %s\n", ladder.Question.Text)
 	fmt.Printf("  budget for this question: $%.2f\n", ladder.Question.BudgetUSD)
 
@@ -151,21 +182,9 @@ func runLoop(ctx context.Context, d *deps, ladder *brain.Ladder, prop *brain.Pro
 		}
 		fmt.Printf("  Go — launched session %s on %s\n", sid, prop.Rung.Chosen.InstanceType)
 
-		// Fetch the rung's result through the gateway (forayd's library, hosted
-		// in-process). register maps the session→worker; trace routes the graph and
-		// bridges the idle signal; only references come back, never tensors.
-		if err := d.tracer.register(ctx, sid, prop.Rung); err != nil {
-			die(fmt.Errorf("register session: %w", err))
-		}
-		tr, err := d.tracer.trace(ctx, sid, prop.Rung)
-		// The tunnel's job ends with this rung's traces. Close it before anything
-		// can exit early below — the next rung launches its own instance, and a
-		// leaked ssh forward would outlive the session it belonged to.
-		if cerr := d.tracer.close(); cerr != nil {
-			fmt.Fprintf(os.Stderr, "  note: closing the worker tunnel for %s: %v\n", sid, cerr)
-		}
+		tr, err := runRung(ctx, d, sid, prop.Rung, keep)
 		if err != nil {
-			die(fmt.Errorf("trace session %s: %w", sid, err))
+			die(err)
 		}
 
 		res, err := d.brain.Interpret(ctx, ladder, prop.Rung, brain.RawResult{
@@ -369,19 +388,6 @@ func buildExporter(ctx context.Context, session string) (*export.Exporter, error
 	if err != nil {
 		return nil, err
 	}
-	// A session is owned by this principal iff spawn knows it. The persistent
-	// session store (deploy step) will resolve real ownership; until then a live
-	// instance the user can see is treated as theirs.
-	owners := func(sid string) (string, bool) {
-		if _, err := d.spawn.Status(ctx, sid); err != nil {
-			return "", false
-		}
-		return d.principal.Subject, true
-	}
-	pol, err := brain.NewCedarExportPolicy(d.principal, owners)
-	if err != nil {
-		return nil, err
-	}
 	bucket := os.Getenv("FORAY_DATA_BUCKET")
 	if bucket == "" {
 		return nil, errors.New("set FORAY_DATA_BUCKET to your in-region saves bucket to export")
@@ -390,7 +396,23 @@ func buildExporter(ctx context.Context, session string) (*export.Exporter, error
 	if err != nil {
 		return nil, fmt.Errorf("load AWS config (set AWS_PROFILE / credentials): %w", err)
 	}
-	presigner := export.NewS3Presigner(s3.NewFromConfig(cfg), bucket, slog.New(slog.NewTextHandler(os.Stderr, nil)))
+	// Ownership comes from the session's saves being in the user's own bucket, not
+	// from its instance still running. A finished session is exactly the one a user
+	// wants to export from, and the run output tells them to (issue #80).
+	s3c := s3.NewFromConfig(cfg)
+	owner := export.NewSessionOwner(s3c, bucket, d.principal.Subject)
+	// Distinguish "nothing saved here" from "not yours" — Cedar's deny reason can
+	// only speak to the second, and the two need different things from the user.
+	if ok, err := owner.Exists(ctx, session); err != nil {
+		return nil, err
+	} else if !ok {
+		return nil, fmt.Errorf("no saved values found for session %s in s3://%s/%s", session, bucket, "sessions/"+session+"/")
+	}
+	pol, err := brain.NewCedarExportPolicy(d.principal, owner.OwnerFunc(ctx))
+	if err != nil {
+		return nil, err
+	}
+	presigner := export.NewS3Presigner(s3c, bucket, slog.New(slog.NewTextHandler(os.Stderr, nil)))
 	return &export.Exporter{Policy: pol, Presigner: presigner}, nil
 }
 
@@ -413,6 +435,64 @@ func (d *deps) regionScope() []string {
 		return nil
 	}
 	return []string{d.region}
+}
+
+// runRung does one approved rung's data-plane work: open a tunnel to the worker,
+// trace, then tear the session down.
+//
+// It exists as a function rather than inline in runLoop so cleanup can be
+// deferred. Cleanup is the whole point: the instance exists from the moment
+// Approve returns, so *every* exit path from here — including a failed trace —
+// has to close the tunnel and reap the instance. runLoop reports errors through
+// die(), which calls os.Exit and therefore runs no defers, so the cleanup has to
+// finish before the error gets there.
+//
+// Order is LIFO and deliberate: close the tunnel first, then terminate the
+// instance it pointed at.
+func runRung(ctx context.Context, d *deps, sid string, r *brain.Rung, keep bool) (gateway.TraceResult, error) {
+	defer reap(ctx, d, sid, keep)
+
+	// register maps the session→worker (opening the spawn service tunnel); trace
+	// routes the graph and bridges the idle signal; only references come back,
+	// never tensors.
+	if err := d.tracer.register(ctx, sid, r); err != nil {
+		return gateway.TraceResult{}, fmt.Errorf("register session: %w", err)
+	}
+	defer func() {
+		if cerr := d.tracer.close(); cerr != nil {
+			fmt.Fprintf(os.Stderr, "  note: closing the worker tunnel for %s: %v\n", sid, cerr)
+		}
+	}()
+
+	tr, err := d.tracer.trace(ctx, sid, r)
+	if err != nil {
+		return gateway.TraceResult{}, fmt.Errorf("trace session %s: %w", sid, err)
+	}
+	return tr, nil
+}
+
+// reap terminates the session's instance, which is what actually reaches $0.
+//
+// spawn's idle timeout only *stops* an instance — it never terminates one, and a
+// stopped instance keeps billing its EBS volumes until TTL (issue #80). Since the
+// control plane knows precisely when a rung is done, it terminates then rather
+// than leaving an idle box billing storage for the rest of its TTL. Idle and TTL
+// remain the backstops for anything that escapes this path.
+//
+// A failed termination is reported, not fatal: the rung's result is already in
+// hand, and TTL still bounds the instance. Telling the user which session to clean
+// up by hand beats discarding their finding.
+func reap(ctx context.Context, d *deps, sid string, keep bool) {
+	if keep {
+		fmt.Printf("    session %s left running (--keep); idle stops it, TTL terminates it.\n", sid)
+		fmt.Printf("    terminate it now with: foray stop %s\n", sid)
+		return
+	}
+	if err := d.spawn.Terminate(ctx, sid); err != nil {
+		fmt.Fprintf(os.Stderr,
+			"  note: could not terminate %s (%v) — TTL will still reap it; `foray stop %s` to be sure\n",
+			sid, err, sid)
+	}
 }
 
 // tracer fetches a rung's result through the gateway library, in-process. It is
