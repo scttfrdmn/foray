@@ -248,13 +248,80 @@ func TestDefaultBehaviorServesTheSPA(t *testing.T) {
 	if got := aws.ToString(cfgOut.DefaultRootObject); got != "index.html" {
 		t.Errorf("default root object = %q", got)
 	}
-	if cfgOut.CustomErrorResponses == nil || len(cfgOut.CustomErrorResponses.Items) != 2 {
-		t.Fatalf("want 403 and 404 rewritten to index.html, got %+v", cfgOut.CustomErrorResponses)
+}
+
+// There must be NO custom error responses.
+//
+// CloudFront applies them across the whole distribution rather than per behavior, so
+// the usual SPA rewrite (403/404 → index.html, 200) also rewrites errors from the API
+// origin. Found on a real deploy: `POST /sessions/<unknown>/trace` returned 200 with
+// the page's HTML instead of forayd's 404 JSON.
+//
+// The severe case is 403: a Cedar denial would become a 200 HTML page, so the policy
+// reason foray goes to some trouble to surface verbatim would never reach the user,
+// and the client would be parsing HTML as JSON.
+func TestNoDistributionWideErrorRewrites(t *testing.T) {
+	d, f := newTestDeployer(t, testConfig())
+	if _, err := d.Apply(context.Background()); err != nil {
+		t.Fatalf("Apply: %v", err)
 	}
-	for _, e := range cfgOut.CustomErrorResponses.Items {
-		if aws.ToString(e.ResponseCode) != "200" || aws.ToString(e.ResponsePagePath) != "/index.html" {
-			t.Errorf("error response %d → %s %s, want 200 /index.html",
-				aws.ToInt32(e.ErrorCode), aws.ToString(e.ResponseCode), aws.ToString(e.ResponsePagePath))
+	cfgOut := f.cf.distByComment(distributionComment).config
+	if n := aws.ToInt32(cfgOut.CustomErrorResponses.Quantity); n != 0 {
+		t.Errorf("distribution has %d custom error response(s) — those rewrite API errors too, "+
+			"turning a 404 or a Cedar 403 into a 200 HTML page", n)
+	}
+	if len(cfgOut.CustomErrorResponses.Items) != 0 {
+		t.Errorf("custom error responses = %+v, want none", cfgOut.CustomErrorResponses.Items)
+	}
+}
+
+// A config change must be rolled out by re-running deploy. Without convergence the
+// only way to fix a distribution is to tear it down and recreate it, which for
+// CloudFront is two multi-minute propagations.
+func TestDistributionConfigConverges(t *testing.T) {
+	d, f := newTestDeployer(t, testConfig())
+	if _, err := d.Apply(context.Background()); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	dist := f.cf.distByComment(distributionComment)
+
+	// Drift it the way the bug looked: reintroduce a distribution-wide error rewrite.
+	dist.config.CustomErrorResponses = &cftypes.CustomErrorResponses{
+		Quantity: aws.Int32(1),
+		Items: []cftypes.CustomErrorResponse{
+			{ErrorCode: aws.Int32(404), ResponseCode: aws.String("200"), ResponsePagePath: aws.String("/index.html")},
+		},
+	}
+
+	if _, err := d.Apply(context.Background()); err != nil {
+		t.Fatalf("re-Apply: %v", err)
+	}
+	if n := aws.ToInt32(f.cf.distByComment(distributionComment).config.CustomErrorResponses.Quantity); n != 0 {
+		t.Errorf("drifted config not converged (%d error responses remain)", n)
+	}
+}
+
+// Convergence must not fire when nothing changed: an identical update still starts a
+// new CloudFront deployment, so a spurious diff would mean minutes of propagation on
+// every single deploy.
+func TestConvergenceIsQuietWhenNothingChanged(t *testing.T) {
+	d, f := newTestDeployer(t, testConfig())
+	if _, err := d.Apply(context.Background()); err != nil {
+		t.Fatalf("first Apply: %v", err)
+	}
+	etagBefore := f.cf.distByComment(distributionComment).etag
+
+	actions, err := d.Apply(context.Background())
+	if err != nil {
+		t.Fatalf("second Apply: %v", err)
+	}
+	if got := f.cf.distByComment(distributionComment).etag; got != etagBefore {
+		t.Errorf("an unchanged re-apply mutated the distribution (etag %s → %s) — every deploy would wait for propagation",
+			etagBefore, got)
+	}
+	for _, a := range actions {
+		if a.Kind == "cloudfront" && strings.Contains(a.Detail, "config updated") {
+			t.Error("reported a config update when nothing changed")
 		}
 	}
 }
@@ -327,5 +394,62 @@ func TestDuplicateDistributionsAreReported(t *testing.T) {
 		t.Fatal("want an error naming the ambiguity")
 	} else if !strings.Contains(err.Error(), "delete the extras") {
 		t.Errorf("error %q should say what to do about it", err)
+	}
+}
+
+// UpdateDistribution replaces the whole configuration and requires every field
+// CloudFront considers part of it, including ones this package never sets — so
+// convergence must read-modify-write rather than send a config built from scratch.
+// The real API rejects the latter with `IllegalUpdate: Aliases are missing for the
+// resource`; the fake models that, so a regression fails here rather than on a live
+// deploy.
+func TestConvergenceUsesReadModifyWrite(t *testing.T) {
+	d, f := newTestDeployer(t, testConfig())
+	if _, err := d.Apply(context.Background()); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	dist := f.cf.distByComment(distributionComment)
+	// Drift something so convergence actually fires.
+	dist.config.DefaultRootObject = aws.String("other.html")
+
+	if _, err := d.Apply(context.Background()); err != nil {
+		t.Fatalf("re-Apply: %v", err)
+	}
+	if f.cf.illegalUpdate {
+		t.Error("convergence sent a config built from scratch — CloudFront requires the full configuration")
+	}
+	if got := aws.ToString(f.cf.distByComment(distributionComment).config.DefaultRootObject); got != "index.html" {
+		t.Errorf("default root object = %q, want it converged back to index.html", got)
+	}
+}
+
+// Fields foray does not manage must survive convergence: an operator may have attached
+// a custom domain and certificate, a WAF, or access logging, and those are theirs.
+func TestConvergencePreservesUnmanagedFields(t *testing.T) {
+	d, f := newTestDeployer(t, testConfig())
+	if _, err := d.Apply(context.Background()); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	dist := f.cf.distByComment(distributionComment)
+	dist.config.Aliases = &cftypes.Aliases{
+		Quantity: aws.Int32(1),
+		Items:    []string{"foray.example.com"},
+	}
+	dist.config.WebACLId = aws.String("arn:aws:wafv2:us-east-1:123:global/webacl/x/y")
+	// Drift a managed field so convergence runs.
+	dist.config.PriceClass = cftypes.PriceClassPriceClassAll
+
+	if _, err := d.Apply(context.Background()); err != nil {
+		t.Fatalf("re-Apply: %v", err)
+	}
+	got := f.cf.distByComment(distributionComment).config
+	if got.Aliases == nil || len(got.Aliases.Items) != 1 || got.Aliases.Items[0] != "foray.example.com" {
+		t.Errorf("custom alias was clobbered: %+v", got.Aliases)
+	}
+	if aws.ToString(got.WebACLId) == "" {
+		t.Error("WebACLId was clobbered — a WAF the operator attached is theirs, not ours")
+	}
+	if got.PriceClass != cftypes.PriceClassPriceClass100 {
+		t.Errorf("price class = %q, want the managed value converged back", got.PriceClass)
 	}
 }

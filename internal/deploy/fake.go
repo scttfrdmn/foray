@@ -1141,6 +1141,8 @@ type fakeCloudFront struct {
 	deleteWhileEnabled bool
 	// staleIfMatch records a delete/update carrying an outdated ETag.
 	staleIfMatch bool
+	// illegalUpdate records an update that dropped a field CloudFront requires.
+	illegalUpdate bool
 }
 
 func newFakeCloudFront() *fakeCloudFront {
@@ -1183,6 +1185,11 @@ func (f *fakeCloudFront) CreateDistributionWithTags(_ context.Context, in *cloud
 		for _, t := range in.DistributionConfigWithTags.Tags.Items {
 			tags[aws.ToString(t.Key)] = aws.ToString(t.Value)
 		}
+	}
+	// CloudFront defaults fields the caller omits; Aliases is one, and its presence is
+	// what makes a from-scratch update illegal.
+	if cfgIn.Aliases == nil {
+		cfgIn.Aliases = &cftypes.Aliases{Quantity: aws.Int32(0)}
 	}
 	d := &fakeDistribution{
 		id:          id,
@@ -1250,6 +1257,15 @@ func (f *fakeCloudFront) UpdateDistribution(_ context.Context, in *cloudfront.Up
 	if aws.ToString(in.IfMatch) != d.etag {
 		f.staleIfMatch = true
 		return nil, &cftypes.PreconditionFailed{Message: aws.String("stale ETag")}
+	}
+	// UpdateDistribution REPLACES the whole configuration and requires every field
+	// CloudFront considers part of it, including ones a caller may never set. A config
+	// built from scratch is rejected — the real API answers
+	// `IllegalUpdate: Aliases are missing for the resource`. Model that, so building a
+	// fresh config instead of read-modify-write fails here rather than on a live deploy.
+	if d.config != nil && d.config.Aliases != nil && in.DistributionConfig.Aliases == nil {
+		f.illegalUpdate = true
+		return nil, &cftypes.IllegalUpdate{Message: aws.String("Aliases are missing for the resource")}
 	}
 	d.enabled = aws.ToBool(in.DistributionConfig.Enabled)
 	d.config = in.DistributionConfig

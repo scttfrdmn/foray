@@ -67,6 +67,25 @@ prefix.
     `application/octet-stream` and the browser downloads the page instead of rendering
     it — and mapped in-process rather than via `mime.TypeByExtension`, which consults
     an OS database that differs between a laptop and a CI container.
+  - **No distribution-wide error rewrites**, and both deployment paths changed here.
+    The obvious SPA move — rewrite 403/404 to `index.html` with a 200 so client routes
+    resolve — is wrong, because **CloudFront applies custom error responses across the
+    whole distribution rather than per behavior**. Found on a real deploy:
+    `POST /sessions/<unknown>/trace` returned `200` with the page's HTML instead of
+    forayd's `404 {"error":"…unknown session"}`. The severe case is 403 — a Cedar denial
+    would become a 200 HTML page, so the policy reason foray goes to some trouble to
+    surface verbatim would never reach the user, and the client would parse HTML as
+    JSON. `web/app.js` has no client-side routing, so nothing needed them. Removed from
+    `deploy/terraform/cdn.tf` too, since the same flaw was there.
+  - **The distribution's configuration converges**, so a config change can be rolled
+    out by re-running deploy rather than requiring a teardown and two multi-minute
+    propagations. It is read-modify-write, not a rebuilt config: `UpdateDistribution`
+    replaces the whole configuration and demands every field CloudFront considers part
+    of it, and fields foray does not manage (a custom domain and certificate, a WAF,
+    access logging) belong to the operator and are carried through untouched. Only a
+    real difference in the managed fields triggers an update — an identical one would
+    still start a new deployment, so a spurious diff would mean minutes of propagation
+    on every deploy.
   - New flags: `--no-wait` and `--web-dir`. Adds `service/cloudfront`. The drift guard
     now covers `cdn.tf` (OAC name, origin ids, all three managed policy ids, path
     patterns, price class) and `storage.tf` (the OAC policy statement and its

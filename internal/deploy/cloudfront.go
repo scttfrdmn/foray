@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -138,6 +139,13 @@ func (d *distribution) ensure(ctx context.Context) (Action, error) {
 		act.Op = OpCreate
 	} else {
 		act.Op = OpExists
+		changed, err := d.converge(ctx, id, oacID)
+		if err != nil {
+			return act, err
+		}
+		if changed {
+			act.Detail = "config updated"
+		}
 	}
 
 	// The web bucket's read policy and the data bucket's CORS rule both name the
@@ -163,6 +171,154 @@ func (d *distribution) ensure(ctx context.Context) (Action, error) {
 	return act, nil
 }
 
+// converge updates an existing distribution when its config no longer matches what
+// this package wants, and reports whether it changed anything.
+//
+// Without this, a configuration fix could not be rolled out by re-running deploy —
+// the operator would have to tear the distribution down and recreate it, which for
+// CloudFront is two multi-minute propagations. That is how the custom-error-response
+// bug above was found *and* how it would have had to be fixed.
+//
+// It compares only the fields this package sets, explicitly, rather than diffing the
+// whole struct: CloudFront returns many defaulted fields we never specify, so a
+// deep comparison would report a difference on every run and trigger a pointless
+// multi-minute redeployment each time.
+func (d *distribution) converge(ctx context.Context, id, oacID string) (bool, error) {
+	cur, err := d.cf.GetDistributionConfig(ctx, &cloudfront.GetDistributionConfigInput{Id: aws.String(id)})
+	if err != nil {
+		return false, fmt.Errorf("get distribution config: %w", err)
+	}
+	host, err := d.apiHost(ctx)
+	if err != nil {
+		return false, err
+	}
+	want := d.config(oacID, host)
+	if !distributionConfigDiffers(cur.DistributionConfig, want) {
+		return false, nil
+	}
+
+	// Read-modify-write, NOT a fresh config.
+	//
+	// UpdateDistribution replaces the entire configuration and requires every field
+	// CloudFront considers part of it — including ones this package never sets. Sending
+	// a config built from scratch is rejected with
+	// `IllegalUpdate: Aliases are missing for the resource`, which is how this was
+	// found on a real deploy.
+	//
+	// It is also the right behavior beyond satisfying the API: an operator may have
+	// attached a custom domain and certificate, a WAF, or access logging. Those are
+	// theirs, so only the fields foray manages are overwritten and everything else is
+	// carried through untouched.
+	updated := *cur.DistributionConfig
+	updated.Origins = want.Origins
+	updated.DefaultCacheBehavior = want.DefaultCacheBehavior
+	updated.CacheBehaviors = want.CacheBehaviors
+	updated.CustomErrorResponses = want.CustomErrorResponses
+	updated.DefaultRootObject = want.DefaultRootObject
+	updated.PriceClass = want.PriceClass
+
+	if _, err := d.cf.UpdateDistribution(ctx, &cloudfront.UpdateDistributionInput{
+		Id:                 aws.String(id),
+		IfMatch:            cur.ETag,
+		DistributionConfig: &updated,
+	}); err != nil {
+		return false, fmt.Errorf("update distribution config: %w", err)
+	}
+	return true, nil
+}
+
+// distributionConfigDiffers compares the fields this package manages. Each one is
+// something a wrong value breaks in a way that is hard to diagnose from the outside,
+// which is why they are worth converging.
+func distributionConfigDiffers(cur, want *cftypes.DistributionConfig) bool {
+	if cur == nil || want == nil {
+		return true
+	}
+	if aws.ToString(cur.DefaultRootObject) != aws.ToString(want.DefaultRootObject) ||
+		cur.PriceClass != want.PriceClass ||
+		aws.ToBool(cur.Enabled) != aws.ToBool(want.Enabled) {
+		return true
+	}
+	// Custom error responses: the count is what matters, because the bug this guards
+	// against is their *presence* (they rewrite API errors distribution-wide).
+	if errorResponseCount(cur) != errorResponseCount(want) {
+		return true
+	}
+	if originSignature(cur.Origins) != originSignature(want.Origins) {
+		return true
+	}
+	if defaultBehaviorSignature(cur.DefaultCacheBehavior) != defaultBehaviorSignature(want.DefaultCacheBehavior) {
+		return true
+	}
+	return behaviorSignature(cur.CacheBehaviors) != behaviorSignature(want.CacheBehaviors)
+}
+
+func errorResponseCount(c *cftypes.DistributionConfig) int32 {
+	if c.CustomErrorResponses == nil {
+		return 0
+	}
+	return aws.ToInt32(c.CustomErrorResponses.Quantity)
+}
+
+// originSignature renders the origins as a comparable string: id, host and OAC.
+func originSignature(o *cftypes.Origins) string {
+	if o == nil {
+		return ""
+	}
+	parts := make([]string, 0, len(o.Items))
+	for _, it := range o.Items {
+		parts = append(parts, fmt.Sprintf("%s|%s|%s",
+			aws.ToString(it.Id), aws.ToString(it.DomainName), aws.ToString(it.OriginAccessControlId)))
+	}
+	sort.Strings(parts)
+	return strings.Join(parts, ",")
+}
+
+func defaultBehaviorSignature(b *cftypes.DefaultCacheBehavior) string {
+	if b == nil {
+		return ""
+	}
+	return fmt.Sprintf("%s|%s|%s",
+		aws.ToString(b.TargetOriginId), aws.ToString(b.CachePolicyId), b.ViewerProtocolPolicy)
+}
+
+// behaviorSignature renders the ordered behaviors: pattern, origin and both policies.
+// A wrong cache policy on /api/* silently caches a trace; a wrong origin request
+// policy gets the request rejected by API Gateway.
+func behaviorSignature(b *cftypes.CacheBehaviors) string {
+	if b == nil {
+		return ""
+	}
+	parts := make([]string, 0, len(b.Items))
+	for _, it := range b.Items {
+		parts = append(parts, fmt.Sprintf("%s|%s|%s|%s",
+			aws.ToString(it.PathPattern), aws.ToString(it.TargetOriginId),
+			aws.ToString(it.CachePolicyId), aws.ToString(it.OriginRequestPolicyId)))
+	}
+	sort.Strings(parts)
+	return strings.Join(parts, ",")
+}
+
+// CloudFront's UpdateDistribution requires a FULLY populated configuration, including
+// a set of legacy fields that CreateDistribution happily defaults. Omitting any one of
+// them is a 400 naming that single field — `The parameter SmoothStreaming flag is
+// missing`, `The 'OriginCustomHeaders' field is missing`, and so on, one round trip at
+// a time.
+//
+// So the desired config sets them explicitly rather than relying on create-time
+// defaults: it has to be complete enough to send *back*, not just complete enough to
+// create. These are the documented defaults, not preferences — except Compress, which
+// is on because every asset here is text.
+func legacyBehaviorDefaults() (smooth *bool, compress *bool, fle *string, lambdaAssoc *cftypes.LambdaFunctionAssociations, funcAssoc *cftypes.FunctionAssociations, signers *cftypes.TrustedSigners, keyGroups *cftypes.TrustedKeyGroups) {
+	return aws.Bool(false),
+		aws.Bool(true),
+		aws.String(""),
+		&cftypes.LambdaFunctionAssociations{Quantity: aws.Int32(0)},
+		&cftypes.FunctionAssociations{Quantity: aws.Int32(0)},
+		&cftypes.TrustedSigners{Enabled: aws.Bool(false), Quantity: aws.Int32(0)},
+		&cftypes.TrustedKeyGroups{Enabled: aws.Bool(false), Quantity: aws.Int32(0)}
+}
+
 // config is the distribution's desired state: the SPA from S3, and /api/* plus
 // /sessions/* passed through to API Gateway uncached.
 func (d *distribution) config(oacID, apiHost string) *cftypes.DistributionConfig {
@@ -172,11 +328,20 @@ func (d *distribution) config(oacID, apiHost string) *cftypes.DistributionConfig
 	}
 	cachedMethods := []cftypes.Method{cftypes.MethodGet, cftypes.MethodHead}
 
+	smooth, compress, fle, lambdaAssoc, funcAssoc, signers, keyGroups := legacyBehaviorDefaults()
+
 	apiBehavior := func(pattern string) cftypes.CacheBehavior {
 		return cftypes.CacheBehavior{
-			PathPattern:          aws.String(pattern),
-			TargetOriginId:       aws.String(originAPI),
-			ViewerProtocolPolicy: cftypes.ViewerProtocolPolicyHttpsOnly,
+			SmoothStreaming:            smooth,
+			Compress:                   compress,
+			FieldLevelEncryptionId:     fle,
+			LambdaFunctionAssociations: lambdaAssoc,
+			FunctionAssociations:       funcAssoc,
+			TrustedSigners:             signers,
+			TrustedKeyGroups:           keyGroups,
+			PathPattern:                aws.String(pattern),
+			TargetOriginId:             aws.String(originAPI),
+			ViewerProtocolPolicy:       cftypes.ViewerProtocolPolicyHttpsOnly,
 			AllowedMethods: &cftypes.AllowedMethods{
 				Quantity: aws.Int32(int32(len(viewerMethods))),
 				Items:    viewerMethods,
@@ -209,6 +374,14 @@ func (d *distribution) config(oacID, apiHost string) *cftypes.DistributionConfig
 			Items: []cftypes.Origin{
 				{
 					Id: aws.String(originWeb),
+					// CloudFront defaults these on create but REQUIRES them on update
+					// (`IllegalUpdate: The 'OriginCustomHeaders' field is missing`), so they
+					// are set explicitly — the desired config has to be complete enough to
+					// send back, not just complete enough to create.
+					OriginPath:         aws.String(""),
+					CustomHeaders:      &cftypes.CustomHeaders{Quantity: aws.Int32(0)},
+					ConnectionAttempts: aws.Int32(3),
+					ConnectionTimeout:  aws.Int32(10),
 					// The regional domain, not the global one: the global form can 307 to
 					// the regional endpoint on a fresh bucket, which CloudFront surfaces
 					// as a signature failure.
@@ -217,8 +390,12 @@ func (d *distribution) config(oacID, apiHost string) *cftypes.DistributionConfig
 					S3OriginConfig:        &cftypes.S3OriginConfig{OriginAccessIdentity: aws.String("")},
 				},
 				{
-					Id:         aws.String(originAPI),
-					DomainName: aws.String(apiHost),
+					Id:                 aws.String(originAPI),
+					DomainName:         aws.String(apiHost),
+					OriginPath:         aws.String(""),
+					CustomHeaders:      &cftypes.CustomHeaders{Quantity: aws.Int32(0)},
+					ConnectionAttempts: aws.Int32(3),
+					ConnectionTimeout:  aws.Int32(10),
 					CustomOriginConfig: &cftypes.CustomOriginConfig{
 						HTTPPort:             aws.Int32(80),
 						HTTPSPort:            aws.Int32(443),
@@ -227,13 +404,22 @@ func (d *distribution) config(oacID, apiHost string) *cftypes.DistributionConfig
 							Quantity: aws.Int32(1),
 							Items:    []cftypes.SslProtocol{cftypes.SslProtocolTLSv12},
 						},
+						OriginReadTimeout:      aws.Int32(30),
+						OriginKeepaliveTimeout: aws.Int32(5),
 					},
 				},
 			},
 		},
 		DefaultCacheBehavior: &cftypes.DefaultCacheBehavior{
-			TargetOriginId:       aws.String(originWeb),
-			ViewerProtocolPolicy: cftypes.ViewerProtocolPolicyRedirectToHttps,
+			SmoothStreaming:            smooth,
+			Compress:                   compress,
+			FieldLevelEncryptionId:     fle,
+			LambdaFunctionAssociations: lambdaAssoc,
+			FunctionAssociations:       funcAssoc,
+			TrustedSigners:             signers,
+			TrustedKeyGroups:           keyGroups,
+			TargetOriginId:             aws.String(originWeb),
+			ViewerProtocolPolicy:       cftypes.ViewerProtocolPolicyRedirectToHttps,
 			AllowedMethods: &cftypes.AllowedMethods{
 				Quantity: aws.Int32(3),
 				Items:    []cftypes.Method{cftypes.MethodGet, cftypes.MethodHead, cftypes.MethodOptions},
@@ -251,15 +437,24 @@ func (d *distribution) config(oacID, apiHost string) *cftypes.DistributionConfig
 				apiBehavior("/sessions/*"),
 			},
 		},
-		// An SPA owns its routing: a path S3 does not have is a client route, not a
-		// missing page, so 403/404 become index.html with a 200.
-		CustomErrorResponses: &cftypes.CustomErrorResponses{
-			Quantity: aws.Int32(2),
-			Items: []cftypes.CustomErrorResponse{
-				{ErrorCode: aws.Int32(403), ResponseCode: aws.String("200"), ResponsePagePath: aws.String("/index.html")},
-				{ErrorCode: aws.Int32(404), ResponseCode: aws.String("200"), ResponsePagePath: aws.String("/index.html")},
-			},
-		},
+		// Deliberately NO custom error responses.
+		//
+		// The obvious SPA move is to rewrite 403/404 to index.html with a 200 so client
+		// routes resolve. It is wrong here, and validating against a real deploy is how
+		// that surfaced: **CloudFront applies custom error responses across the whole
+		// distribution, not per behavior.** They therefore rewrite errors from the API
+		// origin too — `POST /sessions/i-nope/trace` came back as 200 with the page's
+		// HTML instead of forayd's `404 {"error":"…unknown session"}`.
+		//
+		// The severe case is 403: a Cedar denial would be rewritten to a 200 HTML page,
+		// so the policy reason foray goes to some trouble to surface verbatim would
+		// never reach the user, and the client would be parsing HTML as JSON.
+		//
+		// The page needs none of it — web/app.js has no client-side routing (no
+		// pushState, no hashchange, no pathname reads); it is one document that fetches
+		// /api/*. If routing is added later, the right mechanism is a CloudFront
+		// Function attached to the default behavior only, which cannot touch the API.
+		CustomErrorResponses: &cftypes.CustomErrorResponses{Quantity: aws.Int32(0)},
 		Restrictions: &cftypes.Restrictions{
 			GeoRestriction: &cftypes.GeoRestriction{
 				RestrictionType: cftypes.GeoRestrictionTypeNone,
