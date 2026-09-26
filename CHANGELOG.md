@@ -239,6 +239,11 @@ prefix.
 
 ### Changed
 
+- **`make deploy` / `make teardown` now run `foray deploy` / `foray teardown`** — the
+  verb reached parity with the IaC in #85, so the primary path is the primary target.
+  The declarative path stays available as `make deploy-tf` / `make teardown-tf`. Both
+  tag every resource `Project=foray`, so `make teardown-verify` checks either one.
+
 - **foray now terminates a session's instance when the rung ends** (#80), which is
   what actually reaches $0. spawn's idle action only *stops* an instance and a
   stopped instance keeps billing its EBS volumes, so the previous behavior — leave

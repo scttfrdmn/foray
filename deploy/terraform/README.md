@@ -8,11 +8,14 @@ Copyright 2026 Scott Friedman. Apache License 2.0.
 > same control plane directly through the AWS SDK, so Terraform is not a
 > prerequisite — which matters for a tool whose pitch is "all you need is an AWS
 > account". This directory remains the **documented alternate** for anyone who
-> wants declarative infra, and it is still the *complete* path while the verb takes
-> over incrementally (storage + session state so far).
+> wants declarative infra. The verb now covers the whole control plane, and has been
+> hand-validated against a real account end to end.
 >
 > Same decision, same shape as **lagotto**, the spore.host tool in this position:
 > a `deploy` verb as the primary path, declarative templates as the alternate.
+>
+> `make deploy` / `make teardown` run the verb. This directory is
+> `make deploy-tf` / `make teardown-tf`.
 >
 > ```bash
 > foray deploy --dry-run     # what it would create
