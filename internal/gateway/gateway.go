@@ -102,7 +102,14 @@ type Worker interface {
 type Gateway struct {
 	Store  Store
 	Worker Worker
-	Spawn  spore.Spawn // the idle bridge: KeepWarm rolls the deadline forward
+	Spawn  spore.Spawn
+
+	// Handoff is the launch-time path: the graph goes to the session's bucket prefix
+	// and the worker writes its result back (issue #66, handoff.go). Used by the
+	// deployed control plane, where a Lambda cannot hold the SSH forward the CLI's
+	// `spawn service` tunnel relies on. Nil on the CLI path, which has a live
+	// endpoint and uses Worker.
+	Handoff Handoff // the idle bridge: KeepWarm rolls the deadline forward
 
 	// Now lets tests pin the clock; nil → time.Now. The gateway never sleeps or
 	// schedules on it — it only stamps last_request_time.

@@ -255,3 +255,37 @@ func TestFakeSpawnList(t *testing.T) {
 		t.Errorf("LaunchedAt not set: %+v", got[0])
 	}
 }
+
+// The deployed control plane hands work over at launch (#66), so the command must reach
+// spawn — without it the instance boots with nothing to do and the trace never runs.
+func TestSpawnLaunchPassesCommand(t *testing.T) {
+	r := &stubRunner{out: []byte(`{"instance_id":"i-abc","name":"foray-x","state":"running"}`)}
+	cmd := "env FORAY_SESSION_ID=i-abc python3 -m worker.batch"
+	if _, err := NewSpawn(r).Launch(context.Background(), LaunchSpec{
+		Name:         "foray-x",
+		InstanceType: "g7e.xlarge",
+		Command:      cmd,
+	}); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+	if got := argValue(r.gotArgs, "--command"); got != cmd {
+		t.Errorf("--command = %q, want %q", got, cmd)
+	}
+}
+
+// No command means the CLI path: the instance stays idle for `spawn service` to drive,
+// so a stray --command must not appear.
+func TestSpawnLaunchOmitsEmptyCommand(t *testing.T) {
+	r := &stubRunner{out: []byte(`{"instance_id":"i-abc","name":"foray-x","state":"running"}`)}
+	if _, err := NewSpawn(r).Launch(context.Background(), LaunchSpec{
+		Name:         "foray-x",
+		InstanceType: "g7e.xlarge",
+	}); err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+	for _, a := range r.gotArgs {
+		if a == "--command" {
+			t.Error("--command passed with no command set")
+		}
+	}
+}
