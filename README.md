@@ -57,7 +57,8 @@ See **[ARCHITECTURE.md](ARCHITECTURE.md)** for the full design and
   cost is a static bucket and some cold Lambdas.
 - **Data plane — ephemeral, per session.** `spawn` launches the right GPU, the
   `nnsight` worker holds the model and runs interventions, saved values land in
-  S3 in-region, and the instance stops when idle and self-terminates on TTL.
+  S3 in-region, and foray terminates the instance when the experiment ends (idle
+  and TTL are the backstops).
 
 The number that matters is **$/session, not $/hour**.
 

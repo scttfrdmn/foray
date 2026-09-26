@@ -90,22 +90,18 @@ func NewRealDeps(ctx context.Context, log *slog.Logger) (Deps, error) {
 	if bucket == "" {
 		return Deps{}, fmt.Errorf("set FORAY_DATA_BUCKET to the in-region saves bucket")
 	}
-	// A session is owned by this principal iff spawn knows it. The DynamoDB store
-	// holds the durable mapping; ownership for export resolves through spawn's
-	// view today, consistent with the CLI's buildExporter.
-	owners := func(sid string) (string, bool) {
-		if _, err := spawn.Status(ctx, sid); err != nil {
-			return "", false
-		}
-		return principal.Subject, true
-	}
-	pol, err := brain.NewCedarExportPolicy(principal, owners)
+	// Ownership comes from the session's saves living in the user's own bucket, not
+	// from its instance still running — a finished session is precisely the one a
+	// user exports from (issue #80). Mirrors cmd/foray's buildExporter.
+	s3c := s3.NewFromConfig(cfg)
+	owner := export.NewSessionOwner(s3c, bucket, principal.Subject)
+	pol, err := brain.NewCedarExportPolicy(principal, owner.OwnerFunc(ctx))
 	if err != nil {
 		return Deps{}, err
 	}
 	exporter := &export.Exporter{
 		Policy:    pol,
-		Presigner: export.NewS3Presigner(s3.NewFromConfig(cfg), bucket, log),
+		Presigner: export.NewS3Presigner(s3c, bucket, log),
 	}
 
 	return Deps{Brain: b, Gateway: gw, Spawn: spawn, Exporter: exporter}, nil
