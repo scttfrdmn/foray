@@ -20,6 +20,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/apigatewayv2"
+	"github.com/aws/aws-sdk-go-v2/service/cloudfront"
 	cwl "github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/iam"
@@ -63,6 +64,7 @@ func New(ctx context.Context, cfg Config, awsCfg aws.Config) (*Deployer, error) 
 		lam,
 		cwl.NewFromConfig(awsCfg),
 		apigatewayv2.NewFromConfig(awsCfg),
+		cloudfront.NewFromConfig(awsCfg),
 	), nil
 }
 
@@ -81,8 +83,8 @@ func New(ctx context.Context, cfg Config, awsCfg aws.Config) (*Deployer, error) 
 // by reading the created resources, so ordering here is about what must exist
 // before something can be used — not about what must exist before a policy can be
 // written.
-func newWith(cfg Config, ddb dynamoAPI, s3c s3DeployAPI, iamc iamAPI, lam lambdaFullAPI, logs logsAPI, apigw apigwAPI) *Deployer {
-	return newWithZips(cfg, ddb, s3c, iamc, lam, logs, apigw, nil)
+func newWith(cfg Config, ddb dynamoAPI, s3c s3FullAPI, iamc iamAPI, lam lambdaFullAPI, logs logsAPI, apigw apigwAPI, cf cloudfrontAPI) *Deployer {
+	return newWithZips(cfg, ddb, s3c, iamc, lam, logs, apigw, cf, nil)
 }
 
 // withZipReader installs a package loader, or leaves the default (os.ReadFile).
@@ -95,7 +97,7 @@ func withZipReader(f *lambdaFunc, read func(string) ([]byte, error)) *lambdaFunc
 
 // newWithZips is newWith with an injectable deployment-package loader, so the
 // rehearsal and the tests do not need `make lambdas` to have run.
-func newWithZips(cfg Config, ddb dynamoAPI, s3c s3DeployAPI, iamc iamAPI, lam lambdaFullAPI, logs logsAPI, apigw apigwAPI, readZip func(string) ([]byte, error)) *Deployer {
+func newWithZips(cfg Config, ddb dynamoAPI, s3c s3FullAPI, iamc iamAPI, lam lambdaFullAPI, logs logsAPI, apigw apigwAPI, cf cloudfrontAPI, readZip func(string) ([]byte, error)) *Deployer {
 	tableARN := sessionsTableARN(cfg.Region, cfg.AccountID, cfg.SessionsTable)
 	logGroupFor := func(name string) *logGroup {
 		return &logGroup{
@@ -152,6 +154,16 @@ func newWithZips(cfg Config, ddb dynamoAPI, s3c s3DeployAPI, iamc iamAPI, lam la
 			// invoke permissions are written onto them.
 			logGroupFor(apigwLogGroup),
 			forayHTTPAPI(apigw, lam, cfg, logGroupARNOf(cfg, apigwLogGroup)),
+
+			// The CDN last: it fronts the API (so the API must exist to be an origin),
+			// and it owns the two bucket settings that name it — the web bucket's OAC
+			// read policy and the data bucket's CORS origin. Teardown therefore takes it
+			// off first, which also happens to be required: the buckets cannot be
+			// deleted while a distribution is reading them.
+			forayDistribution(cf, s3c, apigw, cfg),
+			// The SPA upload comes after the bucket exists; it is listed last so the
+			// deploy report ends with the page being published.
+			&webSync{api: s3c, bucket: cfg.WebBucket, dir: cfg.WebDir},
 		},
 	}
 }

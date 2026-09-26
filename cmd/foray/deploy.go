@@ -40,6 +40,8 @@ func deployCmd(ctx context.Context, args []string) {
 		webAPIZip  = fs.String("webapi-zip", deploy.DefaultWebAPIZip, "built foray-web Lambda package (make lambdas)")
 		lwaLayer   = fs.String("lwa-layer-arn", "", "pin the Lambda Web Adapter layer ARN (default: resolve the newest published version for the region)")
 		logDays    = fs.Int("log-retention-days", deploy.DefaultLogRetentionDays, "CloudWatch log retention")
+		webDir     = fs.String("web-dir", deploy.DefaultWebDir, "directory holding the static SPA to publish")
+		noWait     = fs.Bool("no-wait", false, "return as soon as CloudFront accepts the distribution instead of waiting for it to reach every edge (minutes)")
 		dryRun     = fs.Bool("dry-run", false, "print what would be created, call no mutating API")
 	)
 	_ = fs.Parse(args)
@@ -53,6 +55,7 @@ func deployCmd(ctx context.Context, args []string) {
 		GatewayZip:    *gatewayZip,
 		WebAPIZip:     *webAPIZip,
 		LWALayerARN:   *lwaLayer,
+		WebDir:        *webDir,
 		//nolint:gosec // retention days is a small positive int from a flag
 		LogRetentionDays: int32(*logDays),
 	})
@@ -60,6 +63,7 @@ func deployCmd(ctx context.Context, args []string) {
 		die(err)
 	}
 	d.DryRun = *dryRun
+	d.NoWait = *noWait
 
 	verb := "deploying"
 	if *dryRun {

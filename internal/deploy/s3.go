@@ -37,6 +37,16 @@ type s3DeployAPI interface {
 	DeleteObjects(ctx context.Context, in *s3.DeleteObjectsInput, opts ...func(*s3.Options)) (*s3.DeleteObjectsOutput, error)
 }
 
+// s3FullAPI is everything this package asks of S3: bucket lifecycle (s3DeployAPI),
+// the policy and CORS settings the CDN writes (s3PolicyAPI), and the SPA upload
+// (webSyncAPI). One client satisfies all three; the interfaces stay split so each
+// resource declares only what it uses.
+type s3FullAPI interface {
+	s3DeployAPI
+	s3PolicyAPI
+	webSyncAPI
+}
+
 // ExportBundleTag marks a zipped export so the data bucket's lifecycle rule can
 // expire bundles *only*. Must match what export.S3Presigner puts on the object —
 // a mismatch would either leave bundles accumulating or, far worse, expire the

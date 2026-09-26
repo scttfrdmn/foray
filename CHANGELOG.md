@@ -36,6 +36,42 @@ prefix.
 
 ### Added
 
+- **`foray deploy`: CloudFront and the SPA upload — #85 increment 4, completing the
+  verb.** `foray deploy` now provisions the whole control plane end to end.
+  - **CloudFront** with the two origins: the SPA from S3 (cached) and `/api/*` plus
+    `/sessions/*` passed through to API Gateway **uncached** — a cached trace or plan
+    would be a correctness bug, not a slow page. The API behaviors use
+    `AllViewerExceptHostHeader`, because API Gateway rejects a request whose `Host` is
+    not its own (the classic 403 for an API behind a CDN). `PriceClass_100` keeps the
+    edge set to the cheapest tier: a static page and a JSON API gain nothing from
+    paying for every edge worldwide. 403/404 rewrite to `index.html` with a 200, since
+    an SPA owns its own routing.
+  - **Origin access control**, so the web bucket stays private and CloudFront signs
+    its origin requests with SigV4.
+  - **The two bucket settings deferred from the storage increment**, which could only
+    be written once the distribution existed: the web bucket's OAC read policy —
+    scoped by `AWS:SourceArn` to *this* distribution, without which it grants every
+    CloudFront distribution in every account read access — and the data bucket's CORS
+    rule, allowing `GET` from the distribution's own origin only.
+  - **Teardown does CloudFront's three-step dance.** A distribution cannot be deleted
+    while enabled; it must be disabled, that change must finish propagating to every
+    edge, and only then can it be deleted, each mutation carrying the current ETag as
+    `If-Match`. `--no-wait` is honored on deploy but **ignored on teardown**: skipping
+    the wait there would not be faster, it would fail. The OAC is removed after the
+    distribution that references it.
+  - **`web/` sync**, replacing the Makefile's `aws s3 sync`. It mirrors rather than
+    uploads: an unchanged file is skipped (S3's ETag is the content MD5 for these
+    single-part uploads) and a file removed from `web/` is removed from the bucket,
+    because a stale asset is served by CloudFront and is far more confusing than a
+    missing one. Content types are set explicitly — without them S3 serves
+    `application/octet-stream` and the browser downloads the page instead of rendering
+    it — and mapped in-process rather than via `mime.TypeByExtension`, which consults
+    an OS database that differs between a laptop and a CI container.
+  - New flags: `--no-wait` and `--web-dir`. Adds `service/cloudfront`. The drift guard
+    now covers `cdn.tf` (OAC name, origin ids, all three managed policy ids, path
+    patterns, price class) and `storage.tf` (the OAC policy statement and its
+    condition).
+
 - **`foray deploy`: the HTTP API — routes, `$default` stage and Lambda invoke
   permissions (#85, increment 3b).** Completes the request path: CloudFront aside,
   the deployed control plane can now serve.

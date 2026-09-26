@@ -16,16 +16,18 @@ package deploy
 
 import (
 	"context"
-	"time"
-
 	"fmt"
-	"github.com/aws/aws-sdk-go-v2/aws"
+	"io"
 	"net/url"
 	"sort"
 	"strings"
+	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/apigatewayv2"
 	apitypes "github.com/aws/aws-sdk-go-v2/service/apigatewayv2/types"
+	"github.com/aws/aws-sdk-go-v2/service/cloudfront"
+	cftypes "github.com/aws/aws-sdk-go-v2/service/cloudfront/types"
 	cwl "github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs"
 	cwltypes "github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs/types"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
@@ -137,11 +139,23 @@ type fakeBucket struct {
 	// user's saved activations.
 	lifecycleInput *s3types.BucketLifecycleConfiguration
 	tags           map[string]string
+	// policy and cors are what the CDN writes once it knows its own identity.
+	policy     string
+	cors       *s3types.CORSConfiguration
+	objectData map[string]fakeObject
+}
+
+// fakeObject records what an upload stored, so content type and change detection are
+// observable.
+type fakeObject struct {
+	etag        string
+	contentType string
 }
 
 type fakeS3 struct {
 	buckets map[string]*fakeBucket
 	creates int
+	puts    int
 	// failCreate/failDelete inject per-bucket failures.
 	failCreate map[string]error
 	failDelete map[string]error
@@ -190,7 +204,12 @@ func (f *fakeS3) CreateBucket(_ context.Context, in *s3.CreateBucketInput, _ ...
 	if in.CreateBucketConfiguration != nil {
 		region = string(in.CreateBucketConfiguration.LocationConstraint)
 	}
-	f.buckets[name] = &fakeBucket{region: region, objects: map[string]struct{}{}, tags: map[string]string{}}
+	f.buckets[name] = &fakeBucket{
+		region:     region,
+		objects:    map[string]struct{}{},
+		tags:       map[string]string{},
+		objectData: map[string]fakeObject{},
+	}
 	return &s3.CreateBucketOutput{}, nil
 }
 
@@ -245,8 +264,18 @@ func (f *fakeS3) ListObjectsV2(_ context.Context, in *s3.ListObjectsV2Input, _ .
 		return nil, &s3types.NoSuchBucket{}
 	}
 	out := &s3.ListObjectsV2Output{IsTruncated: aws.Bool(false)}
+	keys := make([]string, 0, len(b.objects))
 	for k := range b.objects {
-		out.Contents = append(out.Contents, s3types.Object{Key: aws.String(k)})
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		o := s3types.Object{Key: aws.String(k)}
+		if data, ok := b.objectData[k]; ok {
+			// S3 quotes ETags; mirror that so the sync's trimming is exercised.
+			o.ETag = aws.String(`"` + data.etag + `"`)
+		}
+		out.Contents = append(out.Contents, o)
 	}
 	return out, nil
 }
@@ -296,7 +325,20 @@ func NewFake(cfg Config) (*Deployer, error) {
 	}
 	// The rehearsal has no built zips, so hand the Lambdas canned bytes.
 	fakeZip := func(path string) ([]byte, error) { return []byte("fake-zip:" + path), nil }
-	return newWithZips(cfg, newFakeDynamo(), newFakeS3(), newFakeIAM(), newFakeLambda(), newFakeLogs(), newFakeAPIGW(), fakeZip), nil
+	d := newWithZips(cfg, newFakeDynamo(), newFakeS3(), newFakeIAM(), newFakeLambda(), newFakeLogs(),
+		newFakeAPIGW(), newFakeCloudFront(), fakeZip)
+	// The rehearsal has no web/ tree either, and must not sit through a modeled
+	// CloudFront propagation.
+	for _, r := range d.resources {
+		switch res := r.(type) {
+		case *webSync:
+			res.readDir = func(string) ([]string, error) { return []string{"index.html", "app.js", "styles.css"}, nil }
+			res.readFile = func(p string) ([]byte, error) { return []byte("fake:" + p), nil }
+		case *distribution:
+			res.sleep = func(time.Duration) {}
+		}
+	}
+	return d, nil
 }
 
 // --- IAM --------------------------------------------------------------------
@@ -1020,6 +1062,279 @@ func (f *fakeAPIGW) apiByName(name string) *fakeAPI {
 	for _, a := range f.apis {
 		if a.name == name {
 			return a
+		}
+	}
+	return nil
+}
+
+// --- S3 bucket policy / CORS / SPA upload -----------------------------------
+
+func (f *fakeS3) PutBucketPolicy(_ context.Context, in *s3.PutBucketPolicyInput, _ ...func(*s3.Options)) (*s3.PutBucketPolicyOutput, error) {
+	b, ok := f.buckets[aws.ToString(in.Bucket)]
+	if !ok {
+		return nil, &s3types.NoSuchBucket{}
+	}
+	b.policy = aws.ToString(in.Policy)
+	return &s3.PutBucketPolicyOutput{}, nil
+}
+
+func (f *fakeS3) PutBucketCors(_ context.Context, in *s3.PutBucketCorsInput, _ ...func(*s3.Options)) (*s3.PutBucketCorsOutput, error) {
+	b, ok := f.buckets[aws.ToString(in.Bucket)]
+	if !ok {
+		return nil, &s3types.NoSuchBucket{}
+	}
+	b.cors = in.CORSConfiguration
+	return &s3.PutBucketCorsOutput{}, nil
+}
+
+func (f *fakeS3) PutObject(_ context.Context, in *s3.PutObjectInput, _ ...func(*s3.Options)) (*s3.PutObjectOutput, error) {
+	name := aws.ToString(in.Bucket)
+	b, ok := f.buckets[name]
+	if !ok {
+		return nil, &s3types.NoSuchBucket{}
+	}
+	body, err := io.ReadAll(in.Body)
+	if err != nil {
+		return nil, err
+	}
+	key := aws.ToString(in.Key)
+	b.objects[key] = struct{}{}
+	if b.objectData == nil {
+		b.objectData = map[string]fakeObject{}
+	}
+	b.objectData[key] = fakeObject{etag: contentMD5(body), contentType: aws.ToString(in.ContentType)}
+	f.puts++
+	return &s3.PutObjectOutput{}, nil
+}
+
+// --- CloudFront -------------------------------------------------------------
+
+type fakeDistribution struct {
+	id      string
+	comment string
+	domain  string
+	enabled bool
+	// status is "InProgress" until deployTicks polls have elapsed, modeling the
+	// minutes CloudFront takes to propagate to every edge.
+	status      string
+	deployTicks int
+	config      *cftypes.DistributionConfig
+	etag        string
+	etagSeq     int
+	tags        map[string]string
+}
+
+type fakeOAC struct {
+	id   string
+	name string
+	etag string
+}
+
+type fakeCloudFront struct {
+	dists map[string]*fakeDistribution
+	oacs  map[string]*fakeOAC
+	seq   int
+	// propagationTicks is how many GetDistribution calls a change takes to deploy.
+	propagationTicks int
+	// deleteWhileEnabled records an attempt to delete an enabled distribution, which
+	// the real API refuses.
+	deleteWhileEnabled bool
+	// staleIfMatch records a delete/update carrying an outdated ETag.
+	staleIfMatch bool
+}
+
+func newFakeCloudFront() *fakeCloudFront {
+	return &fakeCloudFront{
+		dists:            map[string]*fakeDistribution{},
+		oacs:             map[string]*fakeOAC{},
+		propagationTicks: 2,
+	}
+}
+
+func (f *fakeCloudFront) nextID(prefix string) string {
+	f.seq++
+	return fmt.Sprintf("%s%04d", prefix, f.seq)
+}
+
+func (f *fakeCloudFront) ListDistributions(_ context.Context, _ *cloudfront.ListDistributionsInput, _ ...func(*cloudfront.Options)) (*cloudfront.ListDistributionsOutput, error) {
+	list := &cftypes.DistributionList{IsTruncated: aws.Bool(false)}
+	ids := make([]string, 0, len(f.dists))
+	for id := range f.dists {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	for _, id := range ids {
+		d := f.dists[id]
+		list.Items = append(list.Items, cftypes.DistributionSummary{
+			Id:         aws.String(d.id),
+			Comment:    aws.String(d.comment),
+			DomainName: aws.String(d.domain),
+			Enabled:    aws.Bool(d.enabled),
+		})
+	}
+	return &cloudfront.ListDistributionsOutput{DistributionList: list}, nil
+}
+
+func (f *fakeCloudFront) CreateDistributionWithTags(_ context.Context, in *cloudfront.CreateDistributionWithTagsInput, _ ...func(*cloudfront.Options)) (*cloudfront.CreateDistributionWithTagsOutput, error) {
+	id := f.nextID("E")
+	cfgIn := in.DistributionConfigWithTags.DistributionConfig
+	tags := map[string]string{}
+	if in.DistributionConfigWithTags.Tags != nil {
+		for _, t := range in.DistributionConfigWithTags.Tags.Items {
+			tags[aws.ToString(t.Key)] = aws.ToString(t.Value)
+		}
+	}
+	d := &fakeDistribution{
+		id:          id,
+		comment:     aws.ToString(cfgIn.Comment),
+		domain:      strings.ToLower(id) + ".cloudfront.net",
+		enabled:     aws.ToBool(cfgIn.Enabled),
+		status:      "InProgress",
+		deployTicks: f.propagationTicks,
+		config:      cfgIn,
+		etag:        "etag-0",
+		tags:        tags,
+	}
+	f.dists[id] = d
+	return &cloudfront.CreateDistributionWithTagsOutput{
+		Distribution: &cftypes.Distribution{
+			Id:         aws.String(id),
+			DomainName: aws.String(d.domain),
+			Status:     aws.String(d.status),
+		},
+		ETag: aws.String(d.etag),
+	}, nil
+}
+
+// GetDistribution counts down to Deployed, so a waiting caller actually polls.
+func (f *fakeCloudFront) GetDistribution(_ context.Context, in *cloudfront.GetDistributionInput, _ ...func(*cloudfront.Options)) (*cloudfront.GetDistributionOutput, error) {
+	d, ok := f.dists[aws.ToString(in.Id)]
+	if !ok {
+		return nil, &cftypes.NoSuchDistribution{}
+	}
+	if d.deployTicks > 0 {
+		d.deployTicks--
+		if d.deployTicks == 0 {
+			d.status = "Deployed"
+		}
+	}
+	return &cloudfront.GetDistributionOutput{
+		Distribution: &cftypes.Distribution{
+			Id:         aws.String(d.id),
+			DomainName: aws.String(d.domain),
+			Status:     aws.String(d.status),
+		},
+		ETag: aws.String(d.etag),
+	}, nil
+}
+
+func (f *fakeCloudFront) GetDistributionConfig(_ context.Context, in *cloudfront.GetDistributionConfigInput, _ ...func(*cloudfront.Options)) (*cloudfront.GetDistributionConfigOutput, error) {
+	d, ok := f.dists[aws.ToString(in.Id)]
+	if !ok {
+		return nil, &cftypes.NoSuchDistribution{}
+	}
+	cfgCopy := *d.config
+	cfgCopy.Enabled = aws.Bool(d.enabled)
+	return &cloudfront.GetDistributionConfigOutput{
+		DistributionConfig: &cfgCopy,
+		ETag:               aws.String(d.etag),
+	}, nil
+}
+
+// UpdateDistribution requires the current ETag and rolls it, as the real API does.
+func (f *fakeCloudFront) UpdateDistribution(_ context.Context, in *cloudfront.UpdateDistributionInput, _ ...func(*cloudfront.Options)) (*cloudfront.UpdateDistributionOutput, error) {
+	d, ok := f.dists[aws.ToString(in.Id)]
+	if !ok {
+		return nil, &cftypes.NoSuchDistribution{}
+	}
+	if aws.ToString(in.IfMatch) != d.etag {
+		f.staleIfMatch = true
+		return nil, &cftypes.PreconditionFailed{Message: aws.String("stale ETag")}
+	}
+	d.enabled = aws.ToBool(in.DistributionConfig.Enabled)
+	d.config = in.DistributionConfig
+	d.status = "InProgress"
+	d.deployTicks = f.propagationTicks
+	d.etagSeq++
+	d.etag = fmt.Sprintf("etag-%d", d.etagSeq)
+	return &cloudfront.UpdateDistributionOutput{ETag: aws.String(d.etag)}, nil
+}
+
+// DeleteDistribution refuses an enabled distribution and a stale ETag — the two
+// constraints that make CloudFront teardown a three-step dance.
+func (f *fakeCloudFront) DeleteDistribution(_ context.Context, in *cloudfront.DeleteDistributionInput, _ ...func(*cloudfront.Options)) (*cloudfront.DeleteDistributionOutput, error) {
+	id := aws.ToString(in.Id)
+	d, ok := f.dists[id]
+	if !ok {
+		return nil, &cftypes.NoSuchDistribution{}
+	}
+	if d.enabled {
+		f.deleteWhileEnabled = true
+		return nil, &cftypes.DistributionNotDisabled{Message: aws.String("distribution is not disabled")}
+	}
+	if aws.ToString(in.IfMatch) != d.etag {
+		f.staleIfMatch = true
+		return nil, &cftypes.PreconditionFailed{Message: aws.String("stale ETag")}
+	}
+	delete(f.dists, id)
+	return &cloudfront.DeleteDistributionOutput{}, nil
+}
+
+func (f *fakeCloudFront) ListOriginAccessControls(_ context.Context, _ *cloudfront.ListOriginAccessControlsInput, _ ...func(*cloudfront.Options)) (*cloudfront.ListOriginAccessControlsOutput, error) {
+	list := &cftypes.OriginAccessControlList{}
+	ids := make([]string, 0, len(f.oacs))
+	for id := range f.oacs {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	for _, id := range ids {
+		o := f.oacs[id]
+		list.Items = append(list.Items, cftypes.OriginAccessControlSummary{
+			Id:   aws.String(o.id),
+			Name: aws.String(o.name),
+		})
+	}
+	return &cloudfront.ListOriginAccessControlsOutput{OriginAccessControlList: list}, nil
+}
+
+func (f *fakeCloudFront) CreateOriginAccessControl(_ context.Context, in *cloudfront.CreateOriginAccessControlInput, _ ...func(*cloudfront.Options)) (*cloudfront.CreateOriginAccessControlOutput, error) {
+	id := f.nextID("OAC")
+	f.oacs[id] = &fakeOAC{id: id, name: aws.ToString(in.OriginAccessControlConfig.Name), etag: "oac-etag-0"}
+	return &cloudfront.CreateOriginAccessControlOutput{
+		OriginAccessControl: &cftypes.OriginAccessControl{Id: aws.String(id)},
+		ETag:                aws.String(f.oacs[id].etag),
+	}, nil
+}
+
+func (f *fakeCloudFront) GetOriginAccessControl(_ context.Context, in *cloudfront.GetOriginAccessControlInput, _ ...func(*cloudfront.Options)) (*cloudfront.GetOriginAccessControlOutput, error) {
+	o, ok := f.oacs[aws.ToString(in.Id)]
+	if !ok {
+		return nil, &cftypes.NoSuchOriginAccessControl{}
+	}
+	return &cloudfront.GetOriginAccessControlOutput{
+		OriginAccessControl: &cftypes.OriginAccessControl{Id: aws.String(o.id)},
+		ETag:                aws.String(o.etag),
+	}, nil
+}
+
+func (f *fakeCloudFront) DeleteOriginAccessControl(_ context.Context, in *cloudfront.DeleteOriginAccessControlInput, _ ...func(*cloudfront.Options)) (*cloudfront.DeleteOriginAccessControlOutput, error) {
+	id := aws.ToString(in.Id)
+	o, ok := f.oacs[id]
+	if !ok {
+		return nil, &cftypes.NoSuchOriginAccessControl{}
+	}
+	if aws.ToString(in.IfMatch) != o.etag {
+		f.staleIfMatch = true
+		return nil, &cftypes.PreconditionFailed{Message: aws.String("stale ETag")}
+	}
+	delete(f.oacs, id)
+	return &cloudfront.DeleteOriginAccessControlOutput{}, nil
+}
+
+func (f *fakeCloudFront) distByComment(comment string) *fakeDistribution {
+	for _, d := range f.dists {
+		if d.comment == comment {
+			return d
 		}
 	}
 	return nil

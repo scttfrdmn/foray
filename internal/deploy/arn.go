@@ -80,3 +80,9 @@ func functionARN(region, accountID, funcName string) string {
 func executionARN(region, accountID, apiID string) string {
 	return fmt.Sprintf("arn:%s:execute-api:%s:%s:%s", partition, region, accountID, apiID)
 }
+
+// distributionARN scopes the web bucket's read policy to one distribution. CloudFront
+// is global, so the ARN carries no region.
+func distributionARN(accountID, distributionID string) string {
+	return fmt.Sprintf("arn:%s:cloudfront::%s:distribution/%s", partition, accountID, distributionID)
+}

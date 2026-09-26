@@ -260,3 +260,60 @@ func TestInvokePermissionMatchesTerraform(t *testing.T) {
 		}
 	}
 }
+
+const cdnTerraformPath = "../../deploy/terraform/cdn.tf"
+
+// The CDN's shape must match the Terraform path. The managed policy ids especially:
+// they are opaque UUIDs, so a mismatch is invisible on inspection but changes caching
+// behavior — a cached /api/* response would be a correctness bug, not a slow page.
+func TestCDNShapeMatchesTerraform(t *testing.T) {
+	b, err := os.ReadFile(cdnTerraformPath)
+	if err != nil {
+		t.Fatalf("read %s: %v", cdnTerraformPath, err)
+	}
+	tf := string(b)
+
+	tests := []struct {
+		what string
+		want string
+	}{
+		{"OAC name", OACName},
+		{"web origin id", originWeb},
+		{"api origin id", originAPI},
+		{"CachingOptimized policy (the SPA)", cachePolicyCachingOptimized},
+		{"CachingDisabled policy (/api/*, /sessions/*)", cachePolicyCachingDisabled},
+		{"AllViewerExceptHostHeader policy", originReqAllViewerExceptHostHeader},
+		{"api path pattern", "/api/*"},
+		{"sessions path pattern", "/sessions/*"},
+		{"SPA root object", "index.html"},
+		{"cheapest edge set", "PriceClass_100"},
+		{"sigv4 signing", "sigv4"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.what, func(t *testing.T) {
+			if !strings.Contains(tf, tt.want) {
+				t.Errorf("%s (%q) is not in deploy/terraform/cdn.tf — the two paths have drifted", tt.what, tt.want)
+			}
+		})
+	}
+}
+
+// The web bucket's OAC read policy and the data bucket's CORS rule live in
+// storage.tf on the Terraform side (they reference the distribution), so check there.
+func TestBucketPolicyAndCORSMatchTerraform(t *testing.T) {
+	b, err := os.ReadFile("../../deploy/terraform/storage.tf")
+	if err != nil {
+		t.Fatalf("read storage.tf: %v", err)
+	}
+	tf := string(b)
+	for _, want := range []string{
+		"AllowCloudFrontOACRead", // the statement id
+		"AWS:SourceArn",          // the condition that scopes it to one distribution
+		"cloudfront.amazonaws.com",
+		"s3:GetObject",
+	} {
+		if !strings.Contains(tf, want) {
+			t.Errorf("%q is not in deploy/terraform/storage.tf — the paths would write different bucket policies", want)
+		}
+	}
+}
