@@ -175,18 +175,35 @@ deploy-fake:
 	FORAY_FAKE=1 $(GO) run ./cmd/foray deploy
 	FORAY_FAKE=1 $(GO) run ./cmd/foray teardown --force
 
-## deploy: IaC up via Terraform (S3+CloudFront, API GW+Lambda, IAM, Cedar embedded, DDB).
-## Still the complete path; `foray deploy` (issue #85) is taking over incrementally
-## and covers storage + session state so far.
+# The primary path is `foray deploy` (issue #85): the verb provisions the whole control
+# plane through the AWS SDK, so Terraform is not a prerequisite. Bucket names are
+# globally unique, so they have no default — set FORAY_WEB_BUCKET and FORAY_DATA_BUCKET
+# (or pass --web-bucket/--data-bucket).
+#
+# deploy-tf/teardown-tf remain the declarative alternate for anyone who wants IaC. Both
+# paths tag every resource Project=foray, so teardown-verify checks either one.
+
+## deploy: provision the ~$0 control plane with `foray deploy` (the primary path)
 .PHONY: deploy
-deploy: deploy-check lambdas
+deploy: lambdas
+	$(GO) run ./cmd/foray deploy
+
+## teardown: remove it — leave nothing running, nothing billing
+.PHONY: teardown
+teardown:
+	$(GO) run ./cmd/foray teardown
+	@$(MAKE) teardown-verify
+
+## deploy-tf: the ALTERNATE declarative path — same control plane via Terraform
+.PHONY: deploy-tf
+deploy-tf: deploy-check lambdas
 	cd $(TF_DIR) && terraform init && terraform apply -var-file=$(TF_VARS)
 	aws s3 sync web/ "s3://$$(cd $(TF_DIR) && terraform output -raw web_bucket)/" --delete
 	@echo "==> deployed. page: $$(cd $(TF_DIR) && terraform output -raw cloudfront_domain)"
 
-## teardown: IaC down via Terraform — leave nothing running, nothing billing
-.PHONY: teardown
-teardown:
+## teardown-tf: the ALTERNATE declarative path down
+.PHONY: teardown-tf
+teardown-tf:
 	-aws s3 rm "s3://$$(cd $(TF_DIR) && terraform output -raw web_bucket)/" --recursive 2>/dev/null
 	-aws s3 rm "s3://$$(cd $(TF_DIR) && terraform output -raw data_bucket)/" --recursive 2>/dev/null
 	cd $(TF_DIR) && terraform destroy -var-file=$(TF_VARS)

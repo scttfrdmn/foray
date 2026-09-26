@@ -96,8 +96,9 @@ make lint          # gofmt + go vet + staticcheck
 make test          # go test ./...  (no AWS)
 make demo-fake     # full intent→plan→Go→fake-spawn→receipt, no AWS  (CI gate)
 make worker        # build the nnsight worker image
-make deploy        # IaC up (S3+CloudFront, API GW+Lambda, IAM, Cedar, DDB)
-make teardown      # IaC down — leave nothing running, nothing billing
+make deploy        # control plane up via `foray deploy` (S3+CloudFront, API GW+Lambda,
+                   #   IAM, DDB, Cedar embedded). deploy-tf is the Terraform alternate.
+make teardown      # control plane down — leave nothing running, nothing billing
 ```
 
 ## Build order
