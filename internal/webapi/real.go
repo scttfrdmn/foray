@@ -63,25 +63,30 @@ func NewRealDeps(ctx context.Context, log *slog.Logger) (Deps, error) {
 	runner := spore.NewExecRunner()
 	truffle := spore.NewTruffle(runner)
 	spawn := spore.NewSpawn(runner)
+	task := spore.NewTask(runner)
 	principal := buildPrincipal()
-
-	b, err := brain.NewReal(brain.Config{
-		Invoker:   invoker,
-		Truffle:   truffle,
-		Spawn:     spawn,
-		Principal: principal,
-		Region:    cfg.Region,
-		Spot:      true,
-	})
-	if err != nil {
-		return Deps{}, err
-	}
 
 	bucket := os.Getenv("FORAY_DATA_BUCKET")
 	if bucket == "" {
 		return Deps{}, fmt.Errorf("set FORAY_DATA_BUCKET to the in-region saves bucket")
 	}
 	s3c := s3.NewFromConfig(cfg)
+
+	b, err := brain.NewReal(brain.Config{
+		Invoker:     invoker,
+		Truffle:     truffle,
+		Task:        task,
+		Spawn:       spawn,
+		Principal:   principal,
+		Region:      cfg.Region,
+		Spot:        true,
+		WorkerImage: os.Getenv("FORAY_WORKER_IMAGE"),
+		DataBucket:  bucket,
+		Device:      envOr("FORAY_DEVICE", "cuda"),
+	})
+	if err != nil {
+		return Deps{}, err
+	}
 
 	table := envOr("FORAY_SESSIONS_TABLE", "foray-sessions")
 	gw := &gateway.Gateway{
@@ -92,6 +97,9 @@ func NewRealDeps(ctx context.Context, log *slog.Logger) (Deps, error) {
 		// worker writes its result reference back there. No VPC, no open port, and the
 		// long-timeout HTTP client this path used to need is gone with it.
 		Handoff: gateway.NewS3Handoff(s3c, bucket),
+		// So a container that died before it could write a result ends the page's polling
+		// with a reason instead of a spinner (#103).
+		Task: task,
 	}
 
 	// Ownership comes from the session's saves living in the user's own bucket, not

@@ -24,6 +24,13 @@ UV_PROJECT   ?= --project worker
 WORKER_IMAGE ?= foray-worker:dev
 WORKER_DEVICE ?= cuda
 
+# The ECR repository `foray deploy` creates and the tag the control plane launches
+# from. Both must match internal/deploy (DefaultWorkerRepo / DefaultWorkerTag) — a
+# mismatch pushes the image somewhere nothing pulls it, and the rung fails after the
+# GPU is already billing. TestMakefileAgreesOnTheRepositoryAndTag guards it.
+WORKER_REPO  ?= foray-worker
+WORKER_TAG   ?= dev
+
 .DEFAULT_GOAL := help
 
 ## help: list targets
@@ -85,6 +92,25 @@ license-check:
 .PHONY: worker
 worker:
 	docker build -t $(WORKER_IMAGE) --build-arg FORAY_DEVICE=$(WORKER_DEVICE) -f worker/Dockerfile .
+
+## worker-push: build for the GPU instance's arch and push to ECR (needs AWS creds)
+.PHONY: worker-push
+worker-push:
+	@command -v aws >/dev/null 2>&1 || { echo "error: the aws CLI is required to log in to ECR"; exit 1; }
+	@account=$$(aws sts get-caller-identity --query Account --output text) || exit 1; \
+	 region=$${AWS_REGION:-$$(aws configure get region)}; \
+	 if [ -z "$$region" ]; then echo "error: set AWS_REGION (or a profile region)"; exit 1; fi; \
+	 repo="$$account.dkr.ecr.$$region.amazonaws.com/$(WORKER_REPO)"; \
+	 echo "==> worker-push: $$repo:$(WORKER_TAG)"; \
+	 aws ecr describe-repositories --repository-names $(WORKER_REPO) --region $$region >/dev/null 2>&1 || \
+	   { echo "error: no ECR repository $(WORKER_REPO) in $$region — run 'foray deploy' first"; exit 1; }; \
+	 aws ecr get-login-password --region $$region | docker login --username AWS --password-stdin "$$account.dkr.ecr.$$region.amazonaws.com" || exit 1; \
+	 docker build --platform linux/amd64 -t "$$repo:$(WORKER_TAG)" \
+	   --build-arg FORAY_DEVICE=$(WORKER_DEVICE) -f worker/Dockerfile . || exit 1; \
+	 docker push "$$repo:$(WORKER_TAG)" || exit 1; \
+	 echo; \
+	 echo "  export FORAY_WORKER_IMAGE=$$repo:$(WORKER_TAG)"; \
+	 echo "  (the control plane refuses to launch a rung without it)"
 
 ## worker-sync: install the worker's base + dev deps from the lock (uv)
 .PHONY: worker-sync

@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -69,14 +70,19 @@ func FromEnv() (f Fake, fake bool) {
 	}, false
 }
 
-// NewFake builds the offline set.
+// NewFake builds the offline set. The task fake shares the spawn fake's instance table,
+// as the real pair do: `spawn task run` launches an instance tagged with the task id, so a
+// task that ran is a session `foray sessions`, `foray stop` and the end-of-rung reap can
+// all see. A fake that skipped that would have the rehearsal print a termination failure
+// on every rung.
 func NewFake() Fake {
+	sp := newFakeSpawn()
 	return Fake{
 		Truffle: fakeTruffle{},
-		Spawn:   newFakeSpawn(),
+		Spawn:   sp,
 		Lagotto: fakeLagotto{},
 		Server:  &fakeServer{},
-		Task:    newFakeTask(),
+		Task:    newFakeTask(sp),
 	}
 }
 
@@ -197,10 +203,31 @@ func (s *fakeSpawn) Launch(_ context.Context, spec LaunchSpec) (Instance, error)
 	return inst, nil
 }
 
+// resolve finds an instance by id or by Name, mirroring real spawn: `resolveInstance`
+// treats an identifier starting with "i-" as an exact instance id and anything else as a
+// case-insensitive Name match (spawn cmd/utils.go). foray depends on the name half — a
+// session id is the task id, which becomes the instance's Name tag, and that is the handle
+// `foray stop`, the end-of-rung reap and export ownership all pass. A fake that only knew
+// ids would fail every one of those while staying green.
+//
+// Caller holds the lock.
+func (s *fakeSpawn) resolve(identifier string) (Instance, bool) {
+	if strings.HasPrefix(identifier, "i-") {
+		inst, ok := s.inst[identifier]
+		return inst, ok
+	}
+	for _, inst := range s.inst {
+		if strings.EqualFold(inst.Name, identifier) {
+			return inst, true
+		}
+	}
+	return Instance{}, false
+}
+
 func (s *fakeSpawn) Status(_ context.Context, instanceID string) (Instance, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	inst, ok := s.inst[instanceID]
+	inst, ok := s.resolve(instanceID)
 	if !ok {
 		return Instance{}, errFakeUnknown
 	}
@@ -222,19 +249,19 @@ func (s *fakeSpawn) List(_ context.Context) ([]Instance, error) {
 func (s *fakeSpawn) Terminate(_ context.Context, instanceID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, ok := s.inst[instanceID]; !ok {
+	inst, ok := s.resolve(instanceID)
+	if !ok {
 		return errFakeUnknown
 	}
-	inst := s.inst[instanceID]
 	inst.State = "terminated"
-	s.inst[instanceID] = inst
+	s.inst[inst.ID] = inst
 	return nil
 }
 
 func (s *fakeSpawn) KeepWarm(_ context.Context, instanceID string, lastRequest time.Time) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	inst, ok := s.inst[instanceID]
+	inst, ok := s.resolve(instanceID)
 	if !ok {
 		return errFakeUnknown
 	}
@@ -246,7 +273,8 @@ func (s *fakeSpawn) KeepWarm(_ context.Context, instanceID string, lastRequest t
 	if grace == 0 {
 		grace = defaultKeepWarmGrace
 	}
-	s.idle[instanceID] = lastRequest.Add(grace)
+	// Keyed by the instance's own id, since IdleDeadline is an instance-level probe.
+	s.idle[inst.ID] = lastRequest.Add(grace)
 	return nil
 }
 
@@ -354,17 +382,19 @@ type fakeTask struct {
 	mu       sync.Mutex
 	launched map[string]TaskSpec
 	polls    map[string]int
+	// spawn is the shared instance table, so a launched task is a visible session.
+	spawn Spawn
 	// exitCode is what a completed task reports; non-zero drives the failure path.
 	exitCode int
 	// runErr fails the launch itself.
 	runErr error
 }
 
-func newFakeTask() *fakeTask {
-	return &fakeTask{launched: map[string]TaskSpec{}, polls: map[string]int{}}
+func newFakeTask(sp Spawn) *fakeTask {
+	return &fakeTask{launched: map[string]TaskSpec{}, polls: map[string]int{}, spawn: sp}
 }
 
-func (f *fakeTask) Run(_ context.Context, spec TaskSpec) (TaskRun, error) {
+func (f *fakeTask) Run(ctx context.Context, spec TaskSpec) (TaskRun, error) {
 	if err := spec.validate(); err != nil {
 		return TaskRun{}, err
 	}
@@ -372,9 +402,33 @@ func (f *fakeTask) Run(_ context.Context, spec TaskSpec) (TaskRun, error) {
 		return TaskRun{}, f.runErr
 	}
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.launched[spec.TaskID] = spec
+	f.mu.Unlock()
+
+	// An instance appears, named for the task — what real spawn does, and what makes the
+	// session resolvable by every lifecycle verb. The fake's instance ids ARE the name,
+	// matching foray's session-id-is-instance-id model.
+	if f.spawn != nil {
+		if _, err := f.spawn.Launch(ctx, LaunchSpec{
+			Name:         spec.TaskID,
+			InstanceType: spec.Resources.InstanceType,
+			TTL:          parseTaskTTL(spec.Lifecycle.TTL),
+		}); err != nil {
+			return TaskRun{}, fmt.Errorf("spawn task run %s (fake): %w", spec.TaskID, err)
+		}
+	}
 	return TaskRun{TaskID: spec.TaskID}, nil
+}
+
+// parseTaskTTL reads the lifecycle TTL back into a duration for the fake instance table.
+// An unparseable value cannot happen (validate rejects an empty one and the executor
+// renders a time.Duration), so it degrades to an hour rather than failing a rehearsal.
+func parseTaskTTL(s string) time.Duration {
+	d, err := time.ParseDuration(s)
+	if err != nil || d <= 0 {
+		return time.Hour
+	}
+	return d
 }
 
 func (f *fakeTask) Status(_ context.Context, taskID string) (TaskCompletion, error) {

@@ -228,6 +228,12 @@ func (g *Gateway) Collect(ctx context.Context, sessionID string) (TraceResult, b
 		return TraceResult{}, false, err
 	}
 	if pending {
+		// No result yet — but "not yet" and "never" look identical from the object alone.
+		// Ask the task, so a container that died before it could write anything becomes a
+		// reported failure instead of a poll that never ends.
+		if err := g.checkTaskDied(ctx, sessionID); err != nil {
+			return TraceResult{}, false, err
+		}
 		// Still working: keep the session's activity fresh so the idle window does not
 		// close under a long trace.
 		if err := g.Store.Touch(ctx, sessionID, g.now()); err != nil {
@@ -236,4 +242,35 @@ func (g *Gateway) Collect(ctx context.Context, sessionID string) (TraceResult, b
 		return TraceResult{}, true, nil
 	}
 	return res, false, nil
+}
+
+// checkTaskDied reports an error when the task has finished but left no result.
+//
+// This is race-free because of an ordering in spawn's wrapper: stage-out runs *before*
+// the completion record is written. So a completion record plus a missing result.json
+// means the result was already attempted and did not arrive — it is not coming. Verified
+// in the wrapper's generated script rather than assumed; the reverse order would make
+// this a flake that fails a perfectly good trace.
+//
+// It covers the hole the hand-rolled handoff had: worker/batch.py writes its own error
+// result for a trace that *raises*, but nothing writes anything when the container never
+// reaches Python — a bad image, a failed ECR pull, an OOM during model load. Those used
+// to poll until the caller gave up.
+//
+// A Status call that itself fails is not treated as death: the trace may well be running
+// and the poll is cheap to repeat. Only a positive completion signal ends the wait.
+func (g *Gateway) checkTaskDied(ctx context.Context, sessionID string) error {
+	if g.Task == nil {
+		return nil
+	}
+	st, err := g.Task.Status(ctx, sessionID)
+	if err != nil || !st.Complete {
+		return nil
+	}
+	reason := fmt.Sprintf("the task finished (state %s, exit %d) without writing a result",
+		st.State, st.ExitCode)
+	if st.RetryClass != "" {
+		reason += " — " + st.RetryClass
+	}
+	return fmt.Errorf("%w: %s", ErrTraceFailed, reason)
 }

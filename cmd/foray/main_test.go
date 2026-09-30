@@ -29,20 +29,23 @@ import (
 	"github.com/scttfrdmn/foray/internal/spore"
 )
 
-// failingWorker stands in for a worker that rejects the trace, so the failure path
-// through runRung can be exercised.
-type failingWorker struct{}
+// failingHandoff stands in for a trace the worker refused, so the failure path through
+// runRung can be exercised.
+type failingHandoff struct{}
 
-func (failingWorker) Run(context.Context, string, gateway.Graph) (gateway.TraceResult, error) {
-	return gateway.TraceResult{}, errors.New("graph rejected")
+func (failingHandoff) PutGraph(context.Context, string, gateway.Graph) error { return nil }
+
+func (failingHandoff) GetResult(context.Context, string) (gateway.TraceResult, bool, error) {
+	return gateway.TraceResult{}, false, errors.New("graph rejected")
 }
 
-// newRungFixture builds the offline deps and launches one instance, returning the
-// session id to run a rung against.
+// newRungFixture builds the offline deps, launches one instance so its lifecycle is
+// observable, and hands a graph over for it — the state runLoop is in by the time it
+// calls runRung.
 func newRungFixture(t *testing.T) (*deps, string) {
 	t.Helper()
 	t.Setenv("FORAY_FAKE", "1")
-	d, err := buildFakeDeps(0)
+	d, err := buildFakeDeps(depsOpts{})
 	if err != nil {
 		t.Fatalf("buildFakeDeps: %v", err)
 	}
@@ -52,6 +55,10 @@ func newRungFixture(t *testing.T) (*deps, string) {
 	})
 	if err != nil {
 		t.Fatalf("Launch: %v", err)
+	}
+	rung := &brain.Rung{Model: sizing.Model{Name: "openai-community/gpt2"}, NNSight: "pass"}
+	if err := d.collector.handOff(context.Background(), inst.ID, rung); err != nil {
+		t.Fatalf("handOff: %v", err)
 	}
 	return d, inst.ID
 }
@@ -70,9 +77,8 @@ func stateOf(t *testing.T, d *deps, sid string) string {
 // what actually reaches $0 (issue #80).
 func TestRunRungTerminatesInstance(t *testing.T) {
 	d, sid := newRungFixture(t)
-	rung := &brain.Rung{Model: sizing.Model{Name: "openai-community/gpt2"}, NNSight: "pass"}
 
-	if _, err := runRung(context.Background(), d, sid, rung, false); err != nil {
+	if _, err := runRung(context.Background(), d, sid, false); err != nil {
 		t.Fatalf("runRung: %v", err)
 	}
 	if got := stateOf(t, d, sid); got != "terminated" {
@@ -86,54 +92,38 @@ func TestRunRungTerminatesInstance(t *testing.T) {
 // TTL.
 func TestRunRungTerminatesOnTraceFailure(t *testing.T) {
 	d, sid := newRungFixture(t)
-	d.tracer.gw.Worker = failingWorker{}
-	rung := &brain.Rung{Model: sizing.Model{Name: "openai-community/gpt2"}, NNSight: "pass"}
+	d.collector.gw.Handoff = failingHandoff{}
 
-	if _, err := runRung(context.Background(), d, sid, rung, false); err == nil {
-		t.Fatal("want an error from the failing worker")
+	if _, err := runRung(context.Background(), d, sid, false); err == nil {
+		t.Fatal("want an error from the refused trace")
 	}
 	if got := stateOf(t, d, sid); got != "terminated" {
 		t.Errorf("instance state = %q after a failed trace, want terminated — the GPU would leak", got)
 	}
 }
 
-// --keep is the escape hatch: leave the box up deliberately. Idle and TTL remain
-// the backstops.
-func TestRunRungKeepLeavesInstanceRunning(t *testing.T) {
+// --keep is the escape hatch: don't terminate at end of rung. On the task path the
+// instance's fate is the task's `on_complete`, so what runRung must not do is reap it
+// itself.
+func TestRunRungKeepDoesNotTerminate(t *testing.T) {
 	d, sid := newRungFixture(t)
-	rung := &brain.Rung{Model: sizing.Model{Name: "openai-community/gpt2"}, NNSight: "pass"}
 
-	if _, err := runRung(context.Background(), d, sid, rung, true); err != nil {
+	if _, err := runRung(context.Background(), d, sid, true); err != nil {
 		t.Fatalf("runRung: %v", err)
 	}
-	if got := stateOf(t, d, sid); got != "running" {
-		t.Errorf("instance state = %q with --keep, want running", got)
+	if got := stateOf(t, d, sid); got == "terminated" {
+		t.Error("--keep must not terminate the instance; its disk is the point")
 	}
 }
 
-// The tunnel must be closed by the time the rung returns, on success and on
-// failure alike — a forward outliving its session is a leak of a different kind.
-func TestRunRungClosesTunnel(t *testing.T) {
-	tests := []struct {
-		name   string
-		worker gateway.Worker
-	}{
-		{"successful trace", nil},
-		{"failed trace", failingWorker{}},
+// onComplete is the only place --keep reaches the launch. Terminating by default is the
+// ephemerality invariant; the flag trades it for a disk that survives.
+func TestOnCompleteMapsKeep(t *testing.T) {
+	if got := onComplete(false); got != spore.TaskOnCompleteTerminate {
+		t.Errorf("onComplete(false) = %q, want terminate — nothing may be left billing by default", got)
 	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			d, sid := newRungFixture(t)
-			if tt.worker != nil {
-				d.tracer.gw.Worker = tt.worker
-			}
-			rung := &brain.Rung{Model: sizing.Model{Name: "openai-community/gpt2"}, NNSight: "pass"}
-			_, _ = runRung(context.Background(), d, sid, rung, false)
-
-			if d.tracer.svc != nil {
-				t.Error("tracer still holds a tunnel after the rung ended")
-			}
-		})
+	if got := onComplete(true); got != spore.TaskOnCompleteStop {
+		t.Errorf("onComplete(true) = %q, want stop", got)
 	}
 }
 

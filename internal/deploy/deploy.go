@@ -83,6 +83,10 @@ type Config struct {
 	// SessionsTable is the session<->instance map plus per-question cost receipts.
 	SessionsTable string
 
+	// WorkerRepo is the ECR repository holding the nnsight worker image the session's
+	// GPU instance runs. Empty → DefaultWorkerRepo.
+	WorkerRepo string
+
 	// PlanModelID is the Bedrock inference profile the brain plans with. It is a
 	// policy input, not just a runtime setting: the web API's role is scoped to
 	// exactly this profile's ARN.
@@ -136,6 +140,9 @@ var ErrConfig = errors.New("deploy: invalid configuration")
 func (c *Config) Validate() error {
 	if c.SessionsTable == "" {
 		c.SessionsTable = DefaultSessionsTable
+	}
+	if c.WorkerRepo == "" {
+		c.WorkerRepo = DefaultWorkerRepo
 	}
 	if c.PlanModelID == "" {
 		c.PlanModelID = DefaultPlanModelID

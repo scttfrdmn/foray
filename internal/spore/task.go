@@ -50,6 +50,11 @@ type Task interface {
 	Run(ctx context.Context, spec TaskSpec) (TaskRun, error)
 	// Status reports the task's durable completion record. Pending until the task
 	// finishes, then carries the exit code — including for a failure.
+	//
+	// The record is written *after* stage-out, which is the ordering that makes it a
+	// race-free death signal: if a completion record exists and the declared output does
+	// not, the output is never coming. Verified in spawn's wrapper, not assumed — the
+	// stage-out block precedes the completion heredoc.
 	Status(ctx context.Context, taskID string) (TaskCompletion, error)
 }
 
@@ -80,6 +85,13 @@ type TaskResources struct {
 	Purchase     string `json:"purchase,omitempty"` // spot | on_demand
 	Fallback     string `json:"fallback,omitempty"` // on_demand when spot is unavailable
 	DiskGiB      int32  `json:"disk_gib,omitempty"` // root volume; 0 = the AMI default
+	// S3ReadWrite lists s3://bucket[/prefix] URIs the task needs scoped access to
+	// *beyond* what Inputs/Outputs imply. foray needs it: the worker does its own S3 I/O
+	// for saved activations, which no manifest declares, so without this the instance
+	// role can stage the graph in and the result out but the saves themselves fail.
+	// spawn grants it bucket-scoped (the prefix is advisory) because plugins do
+	// bucket-level ListBucket.
+	S3ReadWrite []string `json:"s3_read_write,omitempty"`
 }
 
 // TaskFile is one staged path. spawn's wrapper copies inputs in before the container
@@ -119,6 +131,11 @@ type TaskCompletion struct {
 	TaskID   string
 	State    string // completed | failed
 	ExitCode int
+	// RetryClass is spawn's classification of *what* failed, in its own priority order:
+	// staging in, the command itself, then output delivery. Worth carrying because the
+	// three are very different reports to a user — a missing graph object, a trace that
+	// raised, and a trace that ran but whose result never reached S3.
+	RetryClass string
 	// Complete is false while the task is still running — spawn reports "no completion
 	// record yet" rather than an error, and so does this.
 	Complete bool
@@ -127,8 +144,12 @@ type TaskCompletion struct {
 // Task lifecycle defaults, matching brain's launch defaults.
 const (
 	TaskOnCompleteTerminate = "terminate"
-	TaskPurchaseSpot        = "spot"
-	TaskFallbackOnDemand    = "on_demand"
+	// TaskOnCompleteStop leaves the instance stopped instead of gone. Its root volume
+	// survives for inspection, and keeps billing until TTL — which is why terminate is
+	// the default and this is only what `foray run --keep` asks for.
+	TaskOnCompleteStop   = "stop"
+	TaskPurchaseSpot     = "spot"
+	TaskFallbackOnDemand = "on_demand"
 )
 
 // task is the real adapter over the spawn binary.
@@ -198,9 +219,10 @@ func parseTaskStatus(taskID string, out []byte) (TaskCompletion, error) {
 		return TaskCompletion{TaskID: taskID, Complete: false}, nil
 	}
 	var rec struct {
-		TaskID   string `json:"task_id"`
-		ExitCode int    `json:"exit_code"`
-		State    string `json:"state"`
+		TaskID     string `json:"task_id"`
+		ExitCode   int    `json:"exit_code"`
+		State      string `json:"state"`
+		RetryClass string `json:"retry_class"`
 	}
 	if err := json.Unmarshal([]byte(trimmed), &rec); err != nil {
 		return TaskCompletion{}, fmt.Errorf("spawn task status %s: parse completion record: %w", taskID, err)
@@ -211,10 +233,11 @@ func parseTaskStatus(taskID string, out []byte) (TaskCompletion, error) {
 		return TaskCompletion{TaskID: taskID, Complete: false}, nil
 	}
 	return TaskCompletion{
-		TaskID:   orDefault(rec.TaskID, taskID),
-		State:    rec.State,
-		ExitCode: rec.ExitCode,
-		Complete: true,
+		TaskID:     orDefault(rec.TaskID, taskID),
+		State:      rec.State,
+		ExitCode:   rec.ExitCode,
+		RetryClass: rec.RetryClass,
+		Complete:   true,
 	}, nil
 }
 

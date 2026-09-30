@@ -22,7 +22,11 @@ package brain
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
+	"strings"
+	"time"
 
 	"github.com/scttfrdmn/foray/internal/sizing"
 )
@@ -121,7 +125,10 @@ type Policy interface {
 
 // Executor launches the approved rung and returns a session id (spawn in prod).
 type Executor interface {
-	Execute(ctx context.Context, q Question, r *Rung) (sessionID string, err error)
+	// Execute launches the rung under the session id the caller chose. It does not mint
+	// one: the graph is written under sessions/<id>/ before the task starts, so the id
+	// has to exist first (#103).
+	Execute(ctx context.Context, q Question, r *Rung, sessionID string) error
 }
 
 // Interpreter turns a rung's raw trace references into a Result framed against
@@ -164,20 +171,59 @@ func (b *Brain) Propose(ctx context.Context, question string) (*Ladder, *Proposa
 // Approve is the HITL acceptance node: the human said "Go" to this rung. It
 // checks policy, launches the rung, advances the cursor, and books the spend.
 // Nothing runs without passing through here.
-func (b *Brain) Approve(ctx context.Context, l *Ladder, p *Proposal) (string, error) {
+// The session id is supplied by the caller rather than returned, because the data plane
+// needs it to exist *before* the instance does: the rung's graph is written to
+// sessions/<id>/ and staged into the task at launch (issue #103). A caller generates one
+// with NewSessionID, hands the graph over, then approves.
+func (b *Brain) Approve(ctx context.Context, l *Ladder, p *Proposal, sessionID string) error {
 	if p == nil || p.Rung == nil {
-		return "", fmt.Errorf("approve: nil proposal")
+		return fmt.Errorf("approve: nil proposal")
+	}
+	if strings.TrimSpace(sessionID) == "" {
+		return fmt.Errorf("approve: a session id is required (see NewSessionID)")
 	}
 	if ok, reason := b.Policy.Permit(ctx, p.Rung); !ok {
-		return "", fmt.Errorf("policy denied rung %d: %s", p.Rung.Index, reason)
+		return fmt.Errorf("policy denied rung %d: %s", p.Rung.Index, reason)
 	}
-	sid, err := b.Exec.Execute(ctx, l.Question, p.Rung)
-	if err != nil {
-		return "", fmt.Errorf("execute rung %d: %w", p.Rung.Index, err)
+	if err := b.Exec.Execute(ctx, l.Question, p.Rung, sessionID); err != nil {
+		return fmt.Errorf("execute rung %d: %w", p.Rung.Index, err)
 	}
 	l.Cursor++
 	l.Spent += p.Rung.EstCostUSD
-	return sid, nil
+	return nil
+}
+
+// NewSessionID mints a session identity for a rung, before anything is launched.
+//
+// It is the caller's to choose because the graph must be written under
+// sessions/<id>/ before the task that reads it starts. It also becomes the task id and
+// therefore the instance's Name tag, which is how `foray sessions`, `foray stop` and
+// spawn's own lookups resolve a session — hence the foray- prefix that
+// spore.Spawn.List filters on.
+//
+// The rung and model appear in it so a human reading `foray sessions` or an EC2 console
+// can tell which experiment a box belongs to; the timestamp and random suffix make it
+// unique across reruns of the same rung.
+func NewSessionID(r *Rung) string {
+	model := "model"
+	if r != nil {
+		model = sanitize(r.Model.Name)
+		if model == "" {
+			model = "model"
+		}
+	}
+	rung := 0
+	if r != nil {
+		rung = r.Index
+	}
+	var b [4]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		// Randomness is for uniqueness, not secrecy: a clock-only id is still unique
+		// enough in practice, so degrade rather than fail an approved rung.
+		return fmt.Sprintf("foray-r%d-%s-%s", rung, model, time.Now().UTC().Format("20060102T150405"))
+	}
+	return fmt.Sprintf("foray-r%d-%s-%s-%s", rung, model,
+		time.Now().UTC().Format("20060102T150405"), hex.EncodeToString(b[:]))
 }
 
 // Interpret turns a rung's raw trace references into a Result framed against the

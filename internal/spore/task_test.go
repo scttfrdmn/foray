@@ -416,3 +416,50 @@ func TestLiveTaskSpecAcceptedBySpawn(t *testing.T) {
 		}
 	}
 }
+
+// A launched task must be a visible session. Real `spawn task run` tags the instance
+// `Name: <task_id>`, and every foray lifecycle path — the end-of-rung reap, `foray
+// sessions`, `foray stop`, export ownership — resolves a session through that name. If the
+// fake did not model it, the rehearsal would pass while the real path failed to reap a GPU.
+func TestFakeTaskLaunchesAResolvableInstance(t *testing.T) {
+	f := NewFake()
+	spec := forayTaskSpec()
+	if _, err := f.Task.Run(context.Background(), spec); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	inst, err := f.Spawn.Status(context.Background(), spec.TaskID)
+	if err != nil {
+		t.Fatalf("Status(%s): %v — the session would be unreachable by every lifecycle verb", spec.TaskID, err)
+	}
+	if inst.Name != spec.TaskID {
+		t.Errorf("Name = %q, want the task id %q", inst.Name, spec.TaskID)
+	}
+	if inst.InstanceType != spec.Resources.InstanceType {
+		t.Errorf("InstanceType = %q, want %q", inst.InstanceType, spec.Resources.InstanceType)
+	}
+	if err := f.Spawn.Terminate(context.Background(), spec.TaskID); err != nil {
+		t.Errorf("Terminate(%s): %v — the end-of-rung reap would report a failure every rung", spec.TaskID, err)
+	}
+}
+
+// Resolution by name is spawn's own rule, not a convenience: an identifier starting with
+// "i-" is an exact instance id, anything else a case-insensitive Name match
+// (spawn cmd/utils.go resolveInstance). The fake must answer the same way.
+func TestFakeSpawnResolvesByIDAndName(t *testing.T) {
+	f := NewFake()
+	inst, err := f.Spawn.Launch(context.Background(), LaunchSpec{
+		Name: "foray-r0-gpt2", InstanceType: "g7e.xlarge",
+	})
+	if err != nil {
+		t.Fatalf("Launch: %v", err)
+	}
+	for _, id := range []string{inst.ID, "foray-r0-gpt2", "FORAY-R0-GPT2"} {
+		if _, err := f.Spawn.Status(context.Background(), id); err != nil {
+			t.Errorf("Status(%q): %v", id, err)
+		}
+	}
+	if _, err := f.Spawn.Status(context.Background(), "i-does-not-exist"); err == nil {
+		t.Error("an unknown instance id must not resolve")
+	}
+}

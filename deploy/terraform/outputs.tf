@@ -47,3 +47,8 @@ output "spawn_instance_profile" {
   description = "Instance profile wrapping the spawn role — pass to spawn launches."
   value       = aws_iam_instance_profile.spawn.name
 }
+
+output "worker_repository_url" {
+  description = "Push the worker image here (make worker-push), and export it as FORAY_WORKER_IMAGE:<tag>."
+  value       = aws_ecr_repository.worker.repository_url
+}

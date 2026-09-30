@@ -317,3 +317,24 @@ func TestBucketPolicyAndCORSMatchTerraform(t *testing.T) {
 		}
 	}
 }
+
+// The worker's image repository must exist on both deployment paths. Without it there is
+// nowhere to push the image, and `spawn task run` has nothing to pull — which is the exact
+// gap issue #103 opened on: the data plane was unrunnable because nothing delivered the
+// worker.
+func TestWorkerRepoExistsInTerraform(t *testing.T) {
+	b, err := os.ReadFile("../../deploy/terraform/storage.tf")
+	if err != nil {
+		t.Fatalf("read storage.tf: %v", err)
+	}
+	tf := string(b)
+	for _, want := range []string{
+		"aws_ecr_repository",
+		"aws_ecr_lifecycle_policy", // an unbounded repository is a growing bill
+	} {
+		if !strings.Contains(tf, want) {
+			t.Errorf("deploy/terraform/storage.tf has no %s — the Terraform path would deploy "+
+				"a control plane whose data plane cannot run", want)
+		}
+	}
+}

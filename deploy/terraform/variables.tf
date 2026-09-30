@@ -85,3 +85,9 @@ variable "log_retention_days" {
   type        = number
   default     = 14
 }
+
+variable "worker_repo_name" {
+  description = "ECR repository holding the nnsight worker image the GPU instance runs. Must match internal/deploy's DefaultWorkerRepo and the Makefile's WORKER_REPO."
+  type        = string
+  default     = "foray-worker"
+}

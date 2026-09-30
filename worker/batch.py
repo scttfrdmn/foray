@@ -12,28 +12,34 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Run one trace handed over at launch, then exit (issue #66).
+"""Run one trace staged in at launch, then exit (issues #66, #103).
 
 The deployed control plane cannot reach the worker. A Lambda cannot hold the SSH
-forward that `spawn service` gives the CLI, VPC-attaching it would add
-hourly-billing endpoints and NAT, and opening the worker's port would reverse the
-loopback-only posture the tunnel exists to provide.
+forward that `spawn service` gave the CLI, VPC-attaching it would add hourly-billing
+endpoints and NAT, and opening the worker's port would reverse the loopback-only
+posture the tunnel existed to provide.
 
 It does not need to reach it. A session runs **exactly one trace** — each rung
 launches a fresh instance, runs one graph, and the instance is terminated — so the
-work is fully known before the instance boots. The control plane writes the graph to
-the session's own prefix in the user's bucket and launches the instance with this
-module as its command; the worker reads the graph, runs it, writes back a *reference*,
-and exits.
+work is fully known before the instance boots. `spawn task run` carries it the rest of
+the way: the control plane writes the graph to the session's prefix in the user's own
+bucket, and spawn stages it into the container **before this module execs**, then
+stages the result back out after it exits.
 
-    sessions/<id>/graph.json    written by the control plane, read here
-    sessions/<id>/result.json   written here, read by the control plane
+    s3://<bucket>/sessions/<id>/graph.json   ->  /tmp/graph.json    (staged in by spawn)
+    /tmp/result.json                         ->  .../result.json    (staged out by spawn)
+
+So both files are local. This module does no S3 I/O for the handoff at all — it reads
+a file, runs the trace, writes a file. It used to fetch the graph itself and poll for
+up to two minutes because the control plane could only write it *after* launching;
+staging inverts that ordering, so both the fetch and the wait are gone.
 
 The result carries references only — `save_ref`, `viz_ref`, the generated `nnsight` —
-never tensors, exactly as the HTTP path does (CLAUDE.md, no automatic egress). A
-failure is written as `{"error": "..."}` rather than left absent, because an absent
-result is indistinguishable from a trace still running: the control plane would poll
-forever instead of telling the user what went wrong.
+never tensors (CLAUDE.md, no automatic egress). A failure is written as
+`{"error": "..."}` rather than left absent, because an absent result is
+indistinguishable from a trace still running: the control plane would poll forever
+instead of telling the user what went wrong. (spawn writes its own completion record
+even on a crash, which covers the case where this module never runs at all.)
 
 Run it the way the control plane does:
 
@@ -46,76 +52,38 @@ import base64
 import binascii
 import json
 import sys
-import time
 from dataclasses import asdict
+from pathlib import Path
 
 from . import config, device, engine, graph
 
-# The graph is written after the instance is launched, because its key contains the
-# instance id — which does not exist until then. The instance takes a minute or more to
-# boot, so the object is almost always there first; waiting closes the race rather than
-# betting on it, and a worker that gave up immediately would fail a session for being
-# early.
-GRAPH_WAIT_SECONDS = 120
-GRAPH_POLL_SECONDS = 2
-
 # Exit codes. The instance is terminated either way, so these are for a human reading
-# the console log — the authoritative outcome is result.json.
+# the console log — the authoritative outcome is result.json. spawn also records the
+# code in the task's completion record, which is how a control plane tells "the trace
+# failed" from "the container never got this far".
 EXIT_OK = 0
 EXIT_FAILED = 1
 
 
-def graph_key(session_id: str) -> str:
-    return f"sessions/{session_id}/graph.json"
-
-
-def result_key(session_id: str) -> str:
-    return f"sessions/{session_id}/result.json"
-
-
-def _s3(settings):
-    """The S3 client, imported lazily so the fake path needs no boto3."""
-    import boto3  # noqa: PLC0415
-
-    return boto3.client("s3", region_name=settings.save_region)
-
-
-def fetch_graph(settings, *, sleep=None) -> graph.Intervention:
-    """Wait for the handed-over graph, then parse it into an Intervention.
+def read_graph(settings) -> graph.Intervention:
+    """Read the staged graph and parse it into an Intervention.
 
     The envelope is what internal/gateway writes: {"engine": str, "payload": base64}.
-    `payload` is base64 because Go marshals []byte that way — the same encoding the
-    HTTP path uses, so graph.parse is reached identically either way.
+    `payload` is base64 because Go marshals []byte that way — unchanged by the move to
+    staging, so graph.parse is reached identically however the work arrived.
 
-    It polls because of an ordering fact, not an S3 one: the graph's key contains the
-    instance id, so the control plane can only write it *after* launching the instance.
-    Booting takes a minute or more, so in practice the object is already there — but
-    giving up on the first miss would fail a session for the worker being early.
+    A missing file is a definite failure, not something to wait for: staging completes
+    before this process starts, so if the file is not there it is not coming.
     """
-    import botocore.exceptions  # noqa: PLC0415
-
-    naptime = sleep or time.sleep
-    client = _s3(settings)
-    key = graph_key(settings.session_id)
-    deadline = time.monotonic() + GRAPH_WAIT_SECONDS
-
-    while True:
-        try:
-            body = client.get_object(Bucket=settings.save_bucket, Key=key)["Body"].read()
-            return parse_envelope(body, settings)
-        except botocore.exceptions.ClientError as exc:
-            # Only "not there yet" is worth waiting on. A permissions or bucket problem
-            # will not fix itself, and polling it for two minutes would just delay a
-            # clear failure.
-            code = exc.response.get("Error", {}).get("Code", "")
-            if code not in ("NoSuchKey", "404", "NotFound"):
-                raise
-            if time.monotonic() >= deadline:
-                raise graph.GraphError(
-                    f"no graph at s3://{settings.save_bucket}/{key} after "
-                    f"{GRAPH_WAIT_SECONDS}s — the control plane never handed one over"
-                ) from exc
-            naptime(GRAPH_POLL_SECONDS)
+    path = Path(settings.graph_path)
+    try:
+        body = path.read_bytes()
+    except OSError as exc:
+        raise graph.GraphError(
+            f"no graph at {path} — spawn stages it in before the container runs, so this "
+            f"means stage-in failed or the control plane never wrote one: {exc}"
+        ) from exc
+    return parse_envelope(body, settings)
 
 
 def parse_envelope(body: bytes, settings) -> graph.Intervention:
@@ -139,13 +107,8 @@ def parse_envelope(body: bytes, settings) -> graph.Intervention:
 
 
 def write_result(settings, result: dict) -> None:
-    """Write result.json for the control plane to collect."""
-    _s3(settings).put_object(
-        Bucket=settings.save_bucket,
-        Key=result_key(settings.session_id),
-        Body=json.dumps(result).encode(),
-        ContentType="application/json",
-    )
+    """Write the result where spawn will stage it out to the session's prefix."""
+    Path(settings.result_path).write_text(json.dumps(result), encoding="utf-8")
 
 
 def run(settings) -> dict:
@@ -155,7 +118,7 @@ def run(settings) -> dict:
     fake.run), so the two entrypoints cannot diverge in what a trace actually does —
     only in how the work arrives and how the answer is returned.
     """
-    iv = fetch_graph(settings)
+    iv = read_graph(settings)
     if settings.fake:
         from . import fake  # noqa: PLC0415  (keep the heavy-free path heavy-free)
 

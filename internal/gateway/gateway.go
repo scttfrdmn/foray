@@ -109,7 +109,13 @@ type Gateway struct {
 	// deployed control plane, where a Lambda cannot hold the SSH forward the CLI's
 	// `spawn service` tunnel relies on. Nil on the CLI path, which has a live
 	// endpoint and uses Worker.
-	Handoff Handoff // the idle bridge: KeepWarm rolls the deadline forward
+	Handoff Handoff
+
+	// Task is `spawn task run`, consulted only to tell a trace that is still working
+	// from one that died without writing a result (handoff.go, Collect). Optional: nil
+	// means Collect polls on the artifact alone, which is what it did before #103 — and
+	// polls forever if the container never gets far enough to write one.
+	Task spore.Task
 
 	// Now lets tests pin the clock; nil → time.Now. The gateway never sleeps or
 	// schedules on it — it only stamps last_request_time.

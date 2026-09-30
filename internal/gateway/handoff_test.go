@@ -29,6 +29,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
+
+	"github.com/scttfrdmn/foray/internal/spore"
 )
 
 // fakeHandoffS3 is a tiny object store: enough for "the graph is written where the
@@ -305,46 +307,169 @@ func TestHandoffResultCarriesNoTensors(t *testing.T) {
 	}
 }
 
-// The handoff is a contract between two languages, and the keys are the whole of it:
-// if Go writes `sessions/<id>/graph.json` and worker/batch.py reads something else, the
-// worker finds nothing and the control plane polls an object that never appears — with
-// no error anywhere to explain it. Same drift-guard idea as the Cedar policy test in
-// internal/catalog.
-func TestHandoffKeysMatchTheWorker(t *testing.T) {
+// The keys are the whole of the handoff contract, and two places spell them: this
+// package writes and reads them, and internal/brain names them as the task spec's staging
+// manifests. If they drift, stage-in silently fetches nothing and the control plane polls
+// an object that never appears — with no error anywhere to explain it.
+//
+// brain does not import this package on purpose (it keeps no gateway dependency), so the
+// guard is a source-level one. It used to point at worker/batch.py, which built the keys
+// itself; under `spawn task run` the worker only sees staged local files and the S3 layout
+// is entirely the control plane's business (#103).
+func TestHandoffKeysMatchTheTaskSpec(t *testing.T) {
+	b, err := os.ReadFile("../brain/real.go")
+	if err != nil {
+		t.Fatalf("read internal/brain/real.go: %v", err)
+	}
+	src := string(b)
+
+	for _, want := range []string{
+		`"s3://%s/sessions/%s/` + graphKeyName + `"`,
+		`"s3://%s/sessions/%s/` + resultKeyName + `"`,
+	} {
+		if !strings.Contains(src, want) {
+			t.Errorf("internal/brain/real.go does not stage %s — the task and the gateway "+
+				"would use different keys", want)
+		}
+	}
+
+}
+
+// The other half of the contract, and still genuinely cross-language: the worker must
+// record a *failure* as its result rather than leaving one absent. An absent result is
+// indistinguishable from a trace still running, and while spawn's completion record now
+// catches a container that died outright (Collect's death detection), a trace that raises
+// inside a healthy container exits 0 in spawn's eyes — only batch.py can report that.
+func TestWorkerRecordsFailuresAsResults(t *testing.T) {
 	b, err := os.ReadFile("../../worker/batch.py")
 	if err != nil {
 		t.Fatalf("read worker/batch.py: %v", err)
 	}
 	src := string(b)
 
-	// The Go side's keys, as the worker must spell them.
-	for _, want := range []string{
-		`f"sessions/{session_id}/` + graphKeyName + `"`,
-		`f"sessions/{session_id}/` + resultKeyName + `"`,
-	} {
-		if !strings.Contains(src, want) {
-			t.Errorf("worker/batch.py does not build %s — the two sides would use different keys", want)
-		}
-	}
-
-	// The result fields the Go side reads must be the ones the worker writes. They come
-	// from worker/engine.py's TraceResult, so check the field names appear on both
-	// sides of the boundary.
 	var r handoffResult
 	fields := reflect.TypeOf(r)
 	for i := 0; i < fields.NumField(); i++ {
-		tag := fields.Field(i).Tag.Get("json")
-		name := strings.Split(tag, ",")[0]
-		if name == "" || name == "-" {
+		name := strings.Split(fields.Field(i).Tag.Get("json"), ",")[0]
+		if name != "error" {
 			continue
 		}
-		// session_id and error are written by batch.py directly; the reference fields
-		// come from the engine's TraceResult, which batch.py serializes wholesale.
-		if name == "error" && !strings.Contains(src, `"error"`) {
+		if !strings.Contains(src, `"`+name+`"`) {
 			t.Errorf("worker/batch.py never writes %q — a failed trace would look pending forever", name)
 		}
 	}
-	if !strings.Contains(src, `"error": message`) && !strings.Contains(src, `"error"`) {
-		t.Error("worker/batch.py must record a failure as an error result")
+}
+
+// --- death detection ---------------------------------------------------------
+
+// stubTask reports a fixed completion, standing in for `spawn task status`.
+type stubTask struct {
+	completion spore.TaskCompletion
+	err        error
+	calls      int
+}
+
+func (s *stubTask) Run(context.Context, spore.TaskSpec) (spore.TaskRun, error) {
+	return spore.TaskRun{}, nil
+}
+
+func (s *stubTask) Status(context.Context, string) (spore.TaskCompletion, error) {
+	s.calls++
+	return s.completion, s.err
+}
+
+// The hole this closes: worker/batch.py writes its own error result for a trace that
+// *raises*, but nothing writes anything when the container never reaches Python — a bad
+// image, a failed ECR pull, an OOM during model load. Before #103 those polled an object
+// that would never appear, forever.
+//
+// It is race-free because spawn's wrapper stages outputs out BEFORE writing the
+// completion record, so a record plus a missing result means the result is not coming.
+func TestCollectReportsATaskThatDiedWithoutAResult(t *testing.T) {
+	tests := []struct {
+		name       string
+		completion spore.TaskCompletion
+		wantInErr  string
+	}{
+		{
+			name: "the command failed",
+			completion: spore.TaskCompletion{
+				Complete: true, State: "failed", ExitCode: 137, RetryClass: "app_error",
+			},
+			wantInErr: "app_error",
+		},
+		{
+			// spawn's own priority order: stage-in failing means nothing ran at all.
+			name: "stage-in failed so the graph never arrived",
+			completion: spore.TaskCompletion{
+				Complete: true, State: "failed", ExitCode: 1, RetryClass: "staging_error",
+			},
+			wantInErr: "staging_error",
+		},
+		{
+			// The cookbook's hard-won lesson (spore-host/spawn#561): an exit code does not
+			// prove the output is real. A task can record completed/0 with its declared
+			// output never staged, so a clean record with no result is still a dead end.
+			name:       "exit 0 but the result never staged",
+			completion: spore.TaskCompletion{Complete: true, State: "completed"},
+			wantInErr:  "without writing a result",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			g, _, _ := newHandoffGateway(t, time.Now())
+			g.Task = &stubTask{completion: tt.completion}
+
+			_, pending, err := g.Collect(context.Background(), "sess-1")
+			if pending {
+				t.Fatal("a finished task with no result must not read as pending — the caller would poll forever")
+			}
+			if !errors.Is(err, ErrTraceFailed) {
+				t.Fatalf("err = %v, want ErrTraceFailed", err)
+			}
+			if !strings.Contains(err.Error(), tt.wantInErr) {
+				t.Errorf("err = %q, should explain %q", err, tt.wantInErr)
+			}
+		})
+	}
+}
+
+// A task still running keeps the wait going, and the session's activity keeps being
+// stamped. This is the common case on every poll before the trace finishes, so reading it
+// as death would fail every single trace.
+func TestCollectKeepsWaitingWhileTheTaskRuns(t *testing.T) {
+	g, _, _ := newHandoffGateway(t, time.Now())
+	task := &stubTask{completion: spore.TaskCompletion{Complete: false}}
+	g.Task = task
+
+	_, pending, err := g.Collect(context.Background(), "sess-1")
+	if err != nil || !pending {
+		t.Fatalf("pending=%v err=%v, want pending with no error", pending, err)
+	}
+	if task.calls != 1 {
+		t.Errorf("Status calls = %d, want 1", task.calls)
+	}
+}
+
+// A Status call that itself fails must not end the wait: the trace may well be running,
+// and one failed `spawn task status` is cheap to repeat. Only a positive completion
+// signal is allowed to declare death.
+func TestCollectIgnoresAFailingStatusCall(t *testing.T) {
+	g, _, _ := newHandoffGateway(t, time.Now())
+	g.Task = &stubTask{err: errors.New("spawn: throttled")}
+
+	_, pending, err := g.Collect(context.Background(), "sess-1")
+	if err != nil || !pending {
+		t.Fatalf("pending=%v err=%v, want the wait to continue", pending, err)
+	}
+}
+
+// With no task wired, Collect behaves as it did before #103 — polling the artifact alone.
+// Worth pinning: the CLI and the deployed path both wire one, and a regression that
+// dropped it would silently restore the endless poll.
+func TestCollectWithoutATaskStillPolls(t *testing.T) {
+	g, _, _ := newHandoffGateway(t, time.Now())
+	if _, pending, err := g.Collect(context.Background(), "sess-1"); err != nil || !pending {
+		t.Fatalf("pending=%v err=%v, want pending", pending, err)
 	}
 }

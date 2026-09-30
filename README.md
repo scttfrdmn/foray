@@ -13,10 +13,13 @@ own AWS account. Then it's gone.
 > clean, with live Bedrock planning, a DynamoDB session round-trip proving the
 > idle bridge fires, and a real presigned export.
 >
-> **The remaining gap is the GPU data plane end-to-end:** the gateway Lambda has
-> no network path to the worker yet
-> ([#66](https://github.com/scttfrdmn/foray/issues/66)), so a real trace against
-> a live GPU is not validated. The worker's real path is exercised by hand via
+> **The remaining gap is the GPU data plane end-to-end.** The path itself is now
+> built: a rung runs as a `spawn task run` task that pulls the worker image from ECR
+> onto a driver-bearing AMI, stages its graph in, stages a result *reference* out, and
+> terminates itself ([#66](https://github.com/scttfrdmn/foray/issues/66),
+> [#103](https://github.com/scttfrdmn/foray/issues/103)) — so there is no longer any
+> inbound path to a worker, from a Lambda or anywhere else. What is still unvalidated
+> is a real trace on a real GPU. The worker's real path is exercised by hand via
 > `make worker-smoke`, never in CI.
 
 [![CI](https://github.com/scttfrdmn/foray/actions/workflows/ci.yml/badge.svg)](https://github.com/scttfrdmn/foray/actions/workflows/ci.yml)
@@ -103,11 +106,16 @@ price, and two invariants turned into build-failing CI gates — a static scan f
 always-on infra, and a reflective test that fails if any trace-result boundary
 struct grows a tensor-bearing field.
 
-**Known gap:** gateway→worker reachability in the deployed control plane
-([#66](https://github.com/scttfrdmn/foray/issues/66)) — VPC-attaching the Lambda
-to reach a private worker would add hourly-billing endpoints/NAT and break the
-~$0 control plane, so the fix has to preserve that invariant. Needs a real GPU to
-validate.
+Then the data plane moved onto `spawn task run`
+([#103](https://github.com/scttfrdmn/foray/issues/103)), which is what finally puts
+the worker on the instance: an ECR image pulled onto a driver-bearing AMI, the graph
+staged in before the container starts, the result staged out, the instance terminated
+on completion — failures included. Worker reachability
+([#66](https://github.com/scttfrdmn/foray/issues/66)) is resolved by not needing it.
+
+**Known gap:** a real trace on a real GPU is still unvalidated end-to-end, and the
+*deployed* page cannot launch one yet — the web-API Lambda has no `spawn` binary and
+its role cannot call EC2. The CLI path is the one that works.
 
 Track everything in
 [Issues](https://github.com/scttfrdmn/foray/issues) and

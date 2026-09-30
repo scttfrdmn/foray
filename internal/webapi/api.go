@@ -196,39 +196,35 @@ func (d Deps) handleApprove(log *slog.Logger) http.HandlerFunc {
 		rung := &l.Rungs[req.RungIndex]
 		prop := &brain.Proposal{Rung: rung}
 
-		// Approve is the sole acceptance node: Cedar, then launch. A policy denial
-		// (e.g. tier exceeds budget) surfaces here with the reason verbatim.
-		sid, err := d.Brain.Approve(ctx, l, prop)
-		if err != nil {
-			log.Warn("approve", "rung", req.RungIndex, "err", err)
-			writeErr(w, http.StatusForbidden, err.Error())
-			return
-		}
+		// The session id is minted before anything launches, because the graph has to be
+		// written under sessions/<id>/ for the task to stage it in (#103).
+		sid := brain.NewSessionID(rung)
 
-		// Record the session first: Collect resolves through it, and the idle bridge
-		// needs a row to stamp.
+		// Record the session first: HandOff stamps activity on it, Collect resolves
+		// through it, and the idle bridge needs a row.
 		if err := d.register(ctx, sid); err != nil {
 			log.Warn("approve: register", "session", sid, "err", err)
 			writeErr(w, http.StatusBadGateway, err.Error())
 			return
 		}
 
-		// Hand the graph to the instance instead of reaching the worker.
-		//
-		// The deployed control plane has no path to the worker — a Lambda cannot hold
-		// the SSH forward the CLI's `spawn service` tunnel uses, and the alternatives
-		// broke either the ~$0 invariant or the loopback-only posture (#66). It does not
-		// need one: the rung runs exactly one trace, so the work is fully known and is
-		// written to the session's own bucket prefix for the booting worker to collect.
-		//
-		// The graph goes over AFTER the launch because its key contains the instance id.
-		// The worker waits for it (worker/batch.py), so being a moment late is fine.
+		// Hand the graph over FIRST. `spawn task run` stages it into the container before
+		// exec, so it must already be there — and a graph written after the task starts
+		// would be a race the worker had to poll around.
 		if err := d.Gateway.HandOff(ctx, sid, gateway.Graph{
 			Engine:  string(rung.Engine),
 			Payload: []byte(rung.NNSight),
 		}); err != nil {
 			log.Warn("approve: handoff", "session", sid, "err", err)
 			writeErr(w, http.StatusBadGateway, err.Error())
+			return
+		}
+
+		// Approve is the sole acceptance node: Cedar, then launch. A policy denial
+		// (e.g. tier exceeds budget) surfaces here with the reason verbatim.
+		if err := d.Brain.Approve(ctx, l, prop, sid); err != nil {
+			log.Warn("approve", "rung", req.RungIndex, "err", err)
+			writeErr(w, http.StatusForbidden, err.Error())
 			return
 		}
 

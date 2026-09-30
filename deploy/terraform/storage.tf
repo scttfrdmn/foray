@@ -116,3 +116,60 @@ resource "aws_s3_bucket_lifecycle_configuration" "data" {
     expiration { days = 1 }
   }
 }
+
+# --- worker image repository -------------------------------------------------
+
+# The nnsight worker image the session's GPU instance runs. Nothing else put the
+# worker on the instance: foray used to launch a bare AL2023 box and run
+# `python3 -m worker.batch` on it, which has no torch, no nnsight and no `worker`
+# package (issue #103). `spawn task run` pulls a container and auto-selects the GPU
+# driver AMI, so what was missing was somewhere to keep the image.
+#
+# Mirrors internal/deploy/ecr.go (workerRepo) — TestWorkerRepoExistsInTerraform
+# guards that both deployment paths have it.
+resource "aws_ecr_repository" "worker" {
+  name = var.worker_repo_name
+  # Mutable so :dev can be re-pushed while iterating. Immutable tags would force a
+  # new tag per build, and the instance launches with whatever tag the control
+  # plane was told about.
+  image_tag_mutability = "MUTABLE"
+  image_scanning_configuration {
+    scan_on_push = true # basic scanning is free
+  }
+  # Delete the images with the repository: leaving multi-GB layers behind is exactly
+  # the standing storage charge `terraform destroy` exists to end, and the image is a
+  # build artifact `make worker-push` recreates, not the user's data.
+  force_delete = true
+}
+
+# Of everything in this stack, the repository is the one resource that grows with
+# use: every push adds layers and nothing removes the old ones. Unbounded, it slowly
+# becomes the largest line on the bill of a control plane meant to rest at ~$0.
+resource "aws_ecr_lifecycle_policy" "worker" {
+  repository = aws_ecr_repository.worker.name
+  policy = jsonencode({
+    rules = [
+      {
+        rulePriority = 1
+        description  = "expire untagged layers"
+        selection = {
+          tagStatus   = "untagged"
+          countType   = "sinceImagePushed"
+          countUnit   = "days"
+          countNumber = 1
+        }
+        action = { type = "expire" }
+      },
+      {
+        rulePriority = 2
+        description  = "keep only recent tagged images"
+        selection = {
+          tagStatus   = "any"
+          countType   = "imageCountMoreThan"
+          countNumber = 5
+        }
+        action = { type = "expire" }
+      },
+    ]
+  })
+}

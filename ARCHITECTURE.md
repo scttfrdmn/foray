@@ -194,13 +194,23 @@ The one genuinely new piece. Responsibilities:
   control-plane round-trip. (`spawn extend` is *not* the lever — it moves the hard
   TTL, which would erode the per-session cost ceiling.)
 
-- **Reach the worker without exposing it.** The worker binds the instance's
-  loopback and is reached through `spawn service`, which forwards a local port to
-  it over SSH and hands back a URL carrying a per-session token. Nothing is
-  exposed to the internet, and no VPC/endpoint/NAT is needed — so the control
-  plane stays at ~$0. This is the CLI path; the deployed page, whose caller is a
-  Lambda that cannot hold a forward, is a documented follow-on (issue #66, and
-  `deploy/terraform/README.md` §"Worker reachability").
+- **Don't reach the worker at all.** A session runs *exactly one trace* — each
+  rung launches a fresh instance, runs one graph, and the instance is terminated —
+  so the work is fully known before the instance exists. The control plane writes
+  the graph to the session's prefix in the user's own bucket and runs the rung as a
+  `spawn task run` task: spawn stages the graph into the container before it execs,
+  and stages the result *reference* back out after it exits. No inbound path, no
+  open port, no VPC/endpoint/NAT — so the control plane stays at ~$0, and the CLI
+  and the deployed page use the same path (issues #66, #103).
+
+  This replaced an SSH forward held open by `spawn service`. The forward worked for
+  the CLI and could never work for the deployed page, whose caller is a Lambda that
+  cannot hold one — and the task path turned out to subsume more than the handoff:
+  container delivery onto a driver-bearing AMI (nothing previously put the worker on
+  the instance at all), staging that removes the worker's wait for its own input, and
+  a durable completion record written *even on a crash*, which is how "the container
+  died without producing a result" becomes a reported failure instead of a poll that
+  never ends.
 
 This is the single load-bearing contract — see `internal/gateway/gateway.go`.
 

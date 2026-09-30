@@ -166,34 +166,40 @@ backend "s3" {
 }
 ```
 
-## Worker reachability
+## Worker reachability — resolved
 
-**The CLI path is solved; the Lambda path is still open.**
+**Both paths are solved, and by not reaching the worker at all** (issues #66, #103).
 
-`foray run` reaches the worker through **`spawn service`** (issue #66): spawn runs
-`python3 -m worker.serve` on the session's instance, the worker binds the
-instance's **loopback** and announces its port and token on one line of stdout,
-and spawn forwards a local port to it over SSH. So the worker is never exposed to
-the internet, there is no security-group port to open, and no VPC, interface
-endpoint or NAT is involved — the control plane stays at ~$0. See
-`internal/spore/service.go` and `worker/serve.py`.
+A session runs *exactly one trace*: each rung launches a fresh instance, runs one
+graph, and the instance is terminated. So the work is fully known before the instance
+exists, and nothing needs a live connection to it. The control plane writes the graph
+to `sessions/<id>/graph.json` in the user's own bucket and runs the rung as a
+**`spawn task run`** task, which:
 
-That mechanism needs an SSH forward held by the calling process, which a Lambda
-cannot do. **The deployed page therefore still has no path to the worker.** The
-two candidate shapes for that half:
+- pulls the worker image from ECR onto an AMI that carries the NVIDIA driver (this is
+  what puts the worker on the instance at all — previously nothing did, and no real
+  trace could run);
+- stages `graph.json` to `/tmp/graph.json` **before the container execs**, so the
+  worker never waits for its own input;
+- stages `/tmp/result.json` back out to `sessions/<id>/result.json` after it exits;
+- writes a durable completion record **even on a crash**, which is how "the container
+  died without writing a result" becomes a reported failure rather than a poll that
+  never ends;
+- terminates the instance on completion, failures included.
 
-- **Public IP + per-session token (stays ~$0).** The worker requires a bearer
-  token; the gateway sends it over the worker's public IP. No VPC, no endpoints,
-  no NAT. Strictly weaker posture than the tunnel for the same money, so it is a
-  fallback rather than a goal. (The worker already accepts a bearer token, so most
-  of this is IAM and a security-group rule.)
-- **Full VPC attach.** VPC-attach both Lambdas, a private worker subnet + SG
-  path, and interface endpoints (Bedrock/DynamoDB/S3). The stronger posture, but
-  the endpoints/NAT bill hourly — this **breaks the "control plane rests at ~$0"
-  invariant**, so it is not the default.
+No inbound path, no security-group port, no VPC, interface endpoint or NAT — the
+control plane stays at ~$0, and the CLI and the deployed page use the same code
+(`internal/gateway/handoff.go`, `internal/brain/real.go`, `worker/batch.py`).
 
-The choice is entangled with whether this control plane keeps its Terraform shape
-at all, so it is deliberately deferred rather than guessed at.
+This replaced an SSH forward held open by `spawn service`, which worked for the CLI
+and could never work for a Lambda. The two alternatives considered — a public IP plus
+a per-session bearer token, and VPC-attaching both Lambdas with interface endpoints —
+are both moot: the first traded posture for nothing, and the second billed hourly and
+broke the ~$0 invariant.
+
+**Publishing the image is a step of its own.** `foray deploy` creates the ECR
+repository; `make worker-push` fills it. A rung refuses to launch without
+`FORAY_WORKER_IMAGE`, rather than starting a GPU that has nothing to run.
 
 Pricing used to be listed here as the same class of gap; it is **resolved** — see
 **Pricing (bundled truffle)** above. `/api/propose` prices in the deployed

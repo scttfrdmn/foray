@@ -70,7 +70,8 @@ func deployCmd(ctx context.Context, args []string) {
 		verb = "planning"
 	}
 	fmt.Printf("\n  %s the foray control plane in %s\n", verb, cfg.Region)
-	fmt.Printf("  web bucket: %s\n  data bucket: %s\n  sessions table: %s\n", cfg.WebBucket, cfg.DataBucket, cfg.SessionsTable)
+	fmt.Printf("  web bucket: %s\n  data bucket: %s\n  sessions table: %s\n  worker image repo: %s\n",
+		cfg.WebBucket, cfg.DataBucket, cfg.SessionsTable, cfg.WorkerRepo)
 	if cfg.LWALayerARN != "" {
 		fmt.Printf("  lambda web adapter: %s\n", cfg.LWALayerARN)
 	}
@@ -90,7 +91,16 @@ func deployCmd(ctx context.Context, args []string) {
 		fmt.Printf("\n  plan only — nothing was created. Drop --dry-run to apply.\n\n")
 		return
 	}
+	// The control plane is up but the data plane is not: the repository exists and is
+	// empty, so a rung would have no image to run. Say so here rather than letting the
+	// first `foray run` discover it — the launch refuses with the same instruction, but
+	// after the user has already written a question.
+	final := d.Config()
 	fmt.Printf("\n  control plane up. `foray teardown` removes it.\n\n")
+	fmt.Printf("  next, publish the worker image (nothing can run a trace until you do):\n")
+	fmt.Printf("    make worker-push\n")
+	fmt.Printf("    export FORAY_DATA_BUCKET=%s\n", final.DataBucket)
+	fmt.Printf("    export FORAY_WORKER_IMAGE=%s\n\n", final.WorkerImageURI(""))
 }
 
 // teardownCmd removes the control plane. Destructive and confirmed, because the
@@ -125,6 +135,7 @@ func teardownCmd(ctx context.Context, args []string) {
 		fmt.Printf("\n  this removes the foray control plane in %s:\n", cfg.Region)
 		fmt.Printf("    - DynamoDB table %s (sessions + cost receipts)\n", cfg.SessionsTable)
 		fmt.Printf("    - S3 bucket %s (the SPA — re-synced by the next deploy)\n", cfg.WebBucket)
+		fmt.Printf("    - ECR repository %s and the worker images in it (make worker-push rebuilds them)\n", cfg.WorkerRepo)
 		fmt.Printf("    - S3 bucket %s — INCLUDING every saved activation and export in it\n", cfg.DataBucket)
 		fmt.Printf("\n  export anything you want to keep first (foray export <session>).\n")
 		if !confirm("  proceed?") {
