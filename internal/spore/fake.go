@@ -46,6 +46,7 @@ type Fake struct {
 	Spawn   Spawn
 	Lagotto Lagotto
 	Server  Server
+	Task    Task
 }
 
 // Enabled reports whether the fake path is active (FORAY_FAKE=1).
@@ -64,6 +65,7 @@ func FromEnv() (f Fake, fake bool) {
 		Spawn:   NewSpawn(r),
 		Lagotto: NewLagotto(r),
 		Server:  NewServer(NewExecStarter()),
+		Task:    NewTask(r),
 	}, false
 }
 
@@ -74,6 +76,7 @@ func NewFake() Fake {
 		Spawn:   newFakeSpawn(),
 		Lagotto: fakeLagotto{},
 		Server:  &fakeServer{},
+		Task:    newFakeTask(),
 	}
 }
 
@@ -339,4 +342,64 @@ func orDefault(v, def string) string {
 		return def
 	}
 	return v
+}
+
+// --- spawn task run fake ----------------------------------------------------
+
+// fakeTask stands in for `spawn task run`. It records launched specs and reports a
+// task as pending on its first status check and complete on the next — deliberately,
+// so the offline rehearsal exercises the caller's poll loop instead of letting it rot
+// (same reasoning as gateway's fake handoff).
+type fakeTask struct {
+	mu       sync.Mutex
+	launched map[string]TaskSpec
+	polls    map[string]int
+	// exitCode is what a completed task reports; non-zero drives the failure path.
+	exitCode int
+	// runErr fails the launch itself.
+	runErr error
+}
+
+func newFakeTask() *fakeTask {
+	return &fakeTask{launched: map[string]TaskSpec{}, polls: map[string]int{}}
+}
+
+func (f *fakeTask) Run(_ context.Context, spec TaskSpec) (TaskRun, error) {
+	if err := spec.validate(); err != nil {
+		return TaskRun{}, err
+	}
+	if f.runErr != nil {
+		return TaskRun{}, f.runErr
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.launched[spec.TaskID] = spec
+	return TaskRun{TaskID: spec.TaskID}, nil
+}
+
+func (f *fakeTask) Status(_ context.Context, taskID string) (TaskCompletion, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, ok := f.launched[taskID]; !ok {
+		// spawn answers "no completion record yet" for an unknown task rather than
+		// erroring, so a never-launched task reads as pending here too.
+		return TaskCompletion{TaskID: taskID}, nil
+	}
+	f.polls[taskID]++
+	if f.polls[taskID] < 2 {
+		return TaskCompletion{TaskID: taskID}, nil
+	}
+	state := "completed"
+	if f.exitCode != 0 {
+		state = "failed"
+	}
+	return TaskCompletion{TaskID: taskID, State: state, ExitCode: f.exitCode, Complete: true}, nil
+}
+
+// Spec returns a launched task's spec, for tests asserting what foray asked spawn for.
+func (f *fakeTask) Spec(taskID string) (TaskSpec, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	s, ok := f.launched[taskID]
+	return s, ok
 }
