@@ -12,16 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for the launch-time handoff entrypoint (issue #66).
+"""Tests for the launch-time handoff entrypoint (issues #66, #103).
 
-No S3, no boto3, no GPU: the S3 calls are the two seams (fetch_graph / write_result),
-so everything else is exercised directly.
+No S3, no boto3, no GPU. There is nothing left to mock for the handoff itself: spawn
+stages the graph in as a local file and stages the result out after exit, so both
+seams are ordinary file I/O against tmp_path.
 """
 
 from __future__ import annotations
 
 import base64
 import json
+from pathlib import Path
 
 import pytest
 
@@ -35,22 +37,28 @@ def envelope(engine: str = "eager", **payload) -> bytes:
 
 
 @pytest.fixture
-def settings(monkeypatch):
+def settings(monkeypatch, tmp_path):
     monkeypatch.setenv("FORAY_FAKE", "1")
     monkeypatch.setenv("FORAY_SESSION_ID", "i-0abc")
     monkeypatch.setenv("FORAY_SAVE_BUCKET", "foray-data")
+    monkeypatch.setenv("FORAY_GRAPH_PATH", str(tmp_path / "graph.json"))
+    monkeypatch.setenv("FORAY_RESULT_PATH", str(tmp_path / "result.json"))
     return config.load()
 
 
-class TestKeys:
-    """The keys must match internal/gateway/handoff.go exactly — a mismatch means the
-    worker reads nothing and the control plane polls an object that never appears."""
+class TestStagedPaths:
+    """The defaults must match the task spec's staging manifests in
+    internal/brain/real.go. They are flat paths in /tmp and not a tidier layout for a
+    verified reason: spawn bind-mounts a staged path's parent as the instance user while
+    `docker run` gets no --user, so only /tmp (1777) is writable by the image's own user
+    (spore-host/spawn#555)."""
 
-    def test_graph_key(self) -> None:
-        assert batch.graph_key("i-0abc") == "sessions/i-0abc/graph.json"
-
-    def test_result_key(self) -> None:
-        assert batch.result_key("i-0abc") == "sessions/i-0abc/result.json"
+    def test_defaults_are_the_staged_tmp_paths(self, monkeypatch) -> None:
+        for var in ("FORAY_GRAPH_PATH", "FORAY_RESULT_PATH"):
+            monkeypatch.delenv(var, raising=False)
+        settings = config.load()
+        assert settings.graph_path == "/tmp/graph.json"
+        assert settings.result_path == "/tmp/result.json"
 
 
 class TestParseEnvelope:
@@ -80,12 +88,31 @@ class TestParseEnvelope:
             batch.parse_envelope(body, settings)
 
 
+class TestReadGraph:
+    def test_reads_the_staged_file(self, settings) -> None:
+        Path(settings.graph_path).write_bytes(envelope(prompt="hi"))
+        assert batch.read_graph(settings).prompt == "hi"
+
+    def test_a_missing_graph_is_a_definite_failure(self, settings) -> None:
+        """Staging completes before this process starts, so an absent file is not
+        something to wait for — it means stage-in failed. The old entrypoint polled for
+        two minutes here; under `spawn task run` that wait would only delay the report."""
+        with pytest.raises(graph.GraphError, match="stages it in"):
+            batch.read_graph(settings)
+
+
+class TestWriteResult:
+    def test_writes_json_where_spawn_stages_it_out(self, settings) -> None:
+        batch.write_result(settings, {"session_id": "i-0abc", "save_ref": "s3://b/x/"})
+        assert json.loads(Path(settings.result_path).read_text())["save_ref"] == "s3://b/x/"
+
+
 class TestRun:
     def test_returns_references_only(self, settings, monkeypatch) -> None:
         """The result carries references and the generated code — never tensors. Same
         invariant the HTTP path enforces (CLAUDE.md, no automatic egress)."""
         monkeypatch.setattr(
-            batch, "fetch_graph", lambda s: batch.parse_envelope(envelope(prompt="hi"), s)
+            batch, "read_graph", lambda s: batch.parse_envelope(envelope(prompt="hi"), s)
         )
         result = batch.run(settings)
 
@@ -99,7 +126,7 @@ class TestMain:
     def test_writes_the_result_on_success(self, settings, monkeypatch) -> None:
         written = {}
         monkeypatch.setattr(
-            batch, "fetch_graph", lambda s: batch.parse_envelope(envelope(prompt="hi"), s)
+            batch, "read_graph", lambda s: batch.parse_envelope(envelope(prompt="hi"), s)
         )
         monkeypatch.setattr(batch, "write_result", lambda s, r: written.update(r))
 
@@ -116,7 +143,7 @@ class TestMain:
         def bad(_s):
             raise graph.GraphError("empty trace payload")
 
-        monkeypatch.setattr(batch, "fetch_graph", bad)
+        monkeypatch.setattr(batch, "read_graph", bad)
         monkeypatch.setattr(batch, "write_result", lambda s, r: written.update(r))
 
         assert batch.main([]) == batch.EXIT_FAILED
@@ -131,7 +158,7 @@ class TestMain:
         def boom(_s):
             raise RuntimeError("CUDA out of memory")
 
-        monkeypatch.setattr(batch, "fetch_graph", boom)
+        monkeypatch.setattr(batch, "read_graph", boom)
         monkeypatch.setattr(batch, "write_result", lambda s, r: written.update(r))
 
         assert batch.main([]) == batch.EXIT_FAILED
@@ -148,68 +175,7 @@ class TestMain:
         def no_write(_s, _r):
             raise RuntimeError("AccessDenied")
 
-        monkeypatch.setattr(batch, "fetch_graph", boom)
+        monkeypatch.setattr(batch, "read_graph", boom)
         monkeypatch.setattr(batch, "write_result", no_write)
 
         assert batch.main([]) == batch.EXIT_FAILED
-
-
-class TestFetchGraphWaits:
-    """The graph's key contains the instance id, so the control plane can only write it
-    AFTER launching. Booting takes a minute or more, so the object is normally already
-    there — but giving up on the first miss would fail a session for being early."""
-
-    @staticmethod
-    def _client_error(code: str):
-        import botocore.exceptions
-
-        return botocore.exceptions.ClientError({"Error": {"Code": code}}, "GetObject")
-
-    def test_retries_until_the_graph_appears(self, settings, monkeypatch) -> None:
-        calls = {"n": 0}
-
-        class Client:
-            def get_object(self, **_kw):
-                calls["n"] += 1
-                if calls["n"] < 3:
-                    raise TestFetchGraphWaits._client_error("NoSuchKey")
-                return {"Body": _Body(envelope(prompt="hi"))}
-
-        monkeypatch.setattr(batch, "_s3", lambda _s: Client())
-        iv = batch.fetch_graph(settings, sleep=lambda _s: None)
-        assert iv.prompt == "hi"
-        assert calls["n"] == 3
-
-    def test_gives_up_with_a_clear_message(self, settings, monkeypatch) -> None:
-        class Client:
-            def get_object(self, **_kw):
-                raise TestFetchGraphWaits._client_error("NoSuchKey")
-
-        monkeypatch.setattr(batch, "_s3", lambda _s: Client())
-        monkeypatch.setattr(batch, "GRAPH_WAIT_SECONDS", 0)
-
-        with pytest.raises(graph.GraphError, match="never handed one over"):
-            batch.fetch_graph(settings, sleep=lambda _s: None)
-
-    def test_does_not_wait_on_a_permissions_error(self, settings, monkeypatch) -> None:
-        """AccessDenied will not fix itself; polling it for two minutes would only delay
-        a clear failure."""
-        import botocore.exceptions
-
-        class Client:
-            def get_object(self, **_kw):
-                raise TestFetchGraphWaits._client_error("AccessDenied")
-
-        monkeypatch.setattr(batch, "_s3", lambda _s: Client())
-        with pytest.raises(botocore.exceptions.ClientError):
-            batch.fetch_graph(settings, sleep=lambda _s: None)
-
-
-class _Body:
-    """Minimal stand-in for S3's streaming body."""
-
-    def __init__(self, data: bytes) -> None:
-        self._data = data
-
-    def read(self) -> bytes:
-        return self._data

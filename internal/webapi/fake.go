@@ -36,9 +36,10 @@ func NewFakeDeps() Deps {
 		// The fake reports pending once before answering, which keeps the polling path
 		// exercised rather than letting it rot.
 		Handoff: gateway.NewFakeHandoff(),
+		Task:    f.Task,
 	}
 	return Deps{
-		Brain:    brain.NewFakeWith(f.Spawn),
+		Brain:    brain.NewFakeWith(f.Task, f.Spawn),
 		Gateway:  gw,
 		Spawn:    f.Spawn,
 		Exporter: export.NewFake(),

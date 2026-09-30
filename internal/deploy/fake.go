@@ -32,6 +32,8 @@ import (
 	cwltypes "github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs/types"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	ddbtypes "github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
+	"github.com/aws/aws-sdk-go-v2/service/ecr"
+	ecrtypes "github.com/aws/aws-sdk-go-v2/service/ecr/types"
 	"github.com/aws/aws-sdk-go-v2/service/iam"
 	iamtypes "github.com/aws/aws-sdk-go-v2/service/iam/types"
 	"github.com/aws/aws-sdk-go-v2/service/lambda"
@@ -307,6 +309,62 @@ func (f *fakeS3) seedObject(bucket, key string) {
 	}
 }
 
+// --- ecr fake ---------------------------------------------------------------
+
+type fakeECR struct {
+	repos map[string]bool
+	// lifecycle records the policy put per repository, so a test can assert the
+	// repository is actually bounded rather than merely created.
+	lifecycle map[string]string
+}
+
+func newFakeECR() *fakeECR {
+	return &fakeECR{repos: map[string]bool{}, lifecycle: map[string]string{}}
+}
+
+func (f *fakeECR) DescribeRepositories(_ context.Context, in *ecr.DescribeRepositoriesInput, _ ...func(*ecr.Options)) (*ecr.DescribeRepositoriesOutput, error) {
+	var out ecr.DescribeRepositoriesOutput
+	for _, name := range in.RepositoryNames {
+		if !f.repos[name] {
+			// ECR's absent answer, so the discovery-instead-of-state-file rule is
+			// exercised rather than assumed.
+			return nil, &ecrtypes.RepositoryNotFoundException{}
+		}
+		out.Repositories = append(out.Repositories, ecrtypes.Repository{
+			RepositoryName: aws.String(name),
+		})
+	}
+	return &out, nil
+}
+
+func (f *fakeECR) CreateRepository(_ context.Context, in *ecr.CreateRepositoryInput, _ ...func(*ecr.Options)) (*ecr.CreateRepositoryOutput, error) {
+	name := aws.ToString(in.RepositoryName)
+	if f.repos[name] {
+		return nil, &ecrtypes.RepositoryAlreadyExistsException{}
+	}
+	f.repos[name] = true
+	return &ecr.CreateRepositoryOutput{}, nil
+}
+
+func (f *fakeECR) DeleteRepository(_ context.Context, in *ecr.DeleteRepositoryInput, _ ...func(*ecr.Options)) (*ecr.DeleteRepositoryOutput, error) {
+	name := aws.ToString(in.RepositoryName)
+	if !f.repos[name] {
+		return nil, &ecrtypes.RepositoryNotFoundException{}
+	}
+	delete(f.repos, name)
+	delete(f.lifecycle, name)
+	return &ecr.DeleteRepositoryOutput{}, nil
+}
+
+func (f *fakeECR) PutLifecyclePolicy(_ context.Context, in *ecr.PutLifecyclePolicyInput, _ ...func(*ecr.Options)) (*ecr.PutLifecyclePolicyOutput, error) {
+	name := aws.ToString(in.RepositoryName)
+	if !f.repos[name] {
+		return nil, &ecrtypes.RepositoryNotFoundException{}
+	}
+	f.lifecycle[name] = aws.ToString(in.LifecyclePolicyText)
+	return &ecr.PutLifecyclePolicyOutput{}, nil
+}
+
 // unused, but keeps the poll seam honest if a wait test needs a clock.
 var _ = time.Sleep
 
@@ -326,7 +384,7 @@ func NewFake(cfg Config) (*Deployer, error) {
 	// The rehearsal has no built zips, so hand the Lambdas canned bytes.
 	fakeZip := func(path string) ([]byte, error) { return []byte("fake-zip:" + path), nil }
 	d := newWithZips(cfg, newFakeDynamo(), newFakeS3(), newFakeIAM(), newFakeLambda(), newFakeLogs(),
-		newFakeAPIGW(), newFakeCloudFront(), fakeZip)
+		newFakeAPIGW(), newFakeCloudFront(), newFakeECR(), fakeZip)
 	// The rehearsal has no web/ tree either, and must not sit through a modeled
 	// CloudFront propagation.
 	for _, r := range d.resources {

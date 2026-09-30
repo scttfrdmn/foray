@@ -4,49 +4,42 @@ Copyright 2026 Scott Friedman. Apache License 2.0.
 
 # foray worker
 
-The one Python boundary in foray (ARCHITECTURE.md §6.7): a FastAPI server that
-receives a serialized `nnsight` intervention graph from `forayd`, runs it
-interleaved with the forward pass on the session's ephemeral GPU, and returns
-**references** to saved values in S3 (in-region) — never tensors.
+The one Python boundary in foray (ARCHITECTURE.md §6.7): it runs a serialized
+`nnsight` intervention graph interleaved with the forward pass on the session's
+ephemeral GPU and returns **references** to saved values in S3 (in-region) — never
+tensors.
 
-The Go control plane (`forayd`) routes graphs to this server over the VPC. The wire
-contract is fixed by `internal/gateway/worker.go`; this server matches it verbatim.
+## How a rung reaches it (`spawn task run`)
 
-## How it is reached (`spawn service`)
-
-The worker is **not** exposed on a public port. `forayd` has no free network path
-to a GPU instance — VPC-attaching a Lambda to reach a private one pulls in
-interface endpoints and NAT, which bill hourly and break the "control plane rests
-at ~$0" invariant — so foray reaches the worker through spawn's own verb for this
-(issue #66):
+**Nothing connects to the worker.** A session runs exactly one trace, so the work is
+fully known before the instance exists, and the control plane hands it over through
+the user's own bucket instead of a network path (issues #66, #103):
 
 ```
-spawn service --host <instance> -o json -- \
-  env FORAY_SESSION_ID=… FORAY_MODEL_URI=… python3 -m worker.serve
+s3://<bucket>/sessions/<id>/graph.json   →  /tmp/graph.json     staged in by spawn
+/tmp/result.json                         →  .../result.json     staged out by spawn
 ```
 
-spawn appends `--addr 127.0.0.1:0`, runs the command on the instance, and forwards
-a local port to whatever the worker binds. The worker listens on **loopback only**
-and is reachable solely through that forward.
+`spawn task run` pulls this directory's image from ECR onto an AMI carrying the NVIDIA
+driver, stages the graph in **before the container execs**, runs
+`python3 -m worker.batch`, stages the result out after it exits, and terminates the
+instance — including when the trace failed. So `worker/batch.py` does no S3 I/O for the
+handoff at all: it reads a file and writes a file.
 
-`worker/serve.py` implements spawn's readiness contract
-(spawn `docs/service-readiness-contract.md`): after binding — never before, since
-the resolved port is the whole point — it prints exactly one line to stdout and
-flushes it.
+There is no inbound path, no open port, and no VPC, interface endpoint or NAT — which
+is what keeps the control plane at ~$0, and what lets the CLI and the deployed page use
+the same code.
 
-```json
-{"event":"ready","addr":"127.0.0.1:54321","token":"…","provenance":{"service":"foray-worker"}}
-```
+A failure is written as `{"error": "..."}` rather than left absent, because an absent
+result is indistinguishable from a trace still running. spawn's own completion record
+covers the harder case: a container that never reaches Python at all.
 
-spawn carries the `token` into the URL it reports, and foray presents it back as
-`Authorization: Bearer <token>` on `/trace` (a header, so the credential stays out
-of logs and error strings; `?token=` is also accepted so the URL spawn prints
-works if a human pastes it). `/healthz` needs no token — a liveness probe that
-fails for want of a credential is a liveness probe that fails for the wrong
-reason.
+## The HTTP server (`worker/app.py`)
 
-Binding anything but loopback is refused outright rather than honored: the tunnel
-is the only intended way in, and a typo should not quietly widen the blast radius.
+The FastAPI server predates the task path and remains for local development and the
+manual GPU smoke — `POST /trace` runs the same `engine.run` that `worker.batch` does,
+so the two entrypoints cannot diverge in what a trace actually does, only in how the
+work arrives. It is **not** how foray runs a rung.
 
 ## Wire contract
 
@@ -55,10 +48,13 @@ is the only intended way in, and a typo should not quietly widen the blast radiu
 | `POST /trace` | `{"engine": "eager"\|"vllm"\|"", "payload": "<base64>"}` | `{"session_id", "save_ref", "viz_ref", "nnsight"}` |
 | `GET /healthz` | — | `{"status", "device", "engine_default", "fake"}` |
 
+The same envelope is what the staged `graph.json` holds, so both entrypoints reach
+`worker/graph.py` identically.
+
 `payload` is base64 because Go marshals `[]byte` as a base64 JSON string. Its
 *interior* (the intervention envelope: `{prompt, saves[], layers[], backward,
-engine}`) is opaque to `forayd` by design — `worker/graph.py` owns it and is the
-seam where real `nnsight` graph deserialization plugs in.
+engine}`) is opaque to the control plane by design — `worker/graph.py` owns it and is
+the seam where real `nnsight` graph deserialization plugs in.
 
 The response carries **references only**. Saved activations land in the user's own
 S3 bucket in-region (`worker/saves.py`); only the `s3://` ref, a rendered-viz ref,
@@ -100,7 +96,7 @@ make worker-sync     # uv sync --project worker  (base + dev, from the lock)
 make worker-test     # pytest under FORAY_FAKE=1 — the CI gate
 make worker-lint     # ruff
 make worker-fake     # the server in fake mode (uvicorn on :8000)
-make worker-serve-fake   # the way `spawn service` runs it: loopback + a readiness
+make worker-serve-fake   # loopback + a readiness
                          # line on stdout — handy for eyeballing the #66 contract
 ```
 
@@ -122,13 +118,19 @@ curl -s localhost:8000/trace -H 'content-type: application/json' \
   -d "{\"engine\":\"eager\",\"payload\":\"$PAYLOAD\"}"
 ```
 
-## Container image (issue #50)
+## Container image (issues #50, #103)
 
-One image holds both engines; the device is injected at run time.
+One image holds both engines; the device is injected at run time. The image is not
+optional infrastructure — it *is* how the worker gets onto the GPU, since
+`spawn task run` launches from it.
 
 ```bash
-make worker                       # docker build -> $(WORKER_IMAGE), WORKER_DEVICE=cuda
+make worker        # build locally -> $(WORKER_IMAGE)
+make worker-push   # build linux/amd64 and push to the ECR repo `foray deploy` created
 ```
+
+`worker-push` prints the `FORAY_WORKER_IMAGE` to export. A rung refuses to launch
+without it rather than starting a GPU with nothing to run.
 
 ## Manual GPU/AWS smoke (not CI)
 
@@ -170,5 +172,7 @@ ssh "ec2-user@$HOST" \
 spawn terminate "$INSTANCE_ID"
 ```
 
-In production this whole dance is what `forayd` + `spawn` automate per session; the
-recipe is the by-hand version for validating the worker against real hardware.
+In production this whole dance is one `spawn task run`: `make worker-push` publishes
+the image once, and each rung launches from it, stages its graph in, and terminates.
+The recipe above is the by-hand version for validating the worker against real
+hardware without involving the control plane.

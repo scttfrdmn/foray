@@ -23,6 +23,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/cloudfront"
 	cwl "github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
+	"github.com/aws/aws-sdk-go-v2/service/ecr"
 	"github.com/aws/aws-sdk-go-v2/service/iam"
 	"github.com/aws/aws-sdk-go-v2/service/lambda"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -65,6 +66,7 @@ func New(ctx context.Context, cfg Config, awsCfg aws.Config) (*Deployer, error) 
 		cwl.NewFromConfig(awsCfg),
 		apigatewayv2.NewFromConfig(awsCfg),
 		cloudfront.NewFromConfig(awsCfg),
+		ecr.NewFromConfig(awsCfg),
 	), nil
 }
 
@@ -83,8 +85,8 @@ func New(ctx context.Context, cfg Config, awsCfg aws.Config) (*Deployer, error) 
 // by reading the created resources, so ordering here is about what must exist
 // before something can be used — not about what must exist before a policy can be
 // written.
-func newWith(cfg Config, ddb dynamoAPI, s3c s3FullAPI, iamc iamAPI, lam lambdaFullAPI, logs logsAPI, apigw apigwAPI, cf cloudfrontAPI) *Deployer {
-	return newWithZips(cfg, ddb, s3c, iamc, lam, logs, apigw, cf, nil)
+func newWith(cfg Config, ddb dynamoAPI, s3c s3FullAPI, iamc iamAPI, lam lambdaFullAPI, logs logsAPI, apigw apigwAPI, cf cloudfrontAPI, ecrc ecrAPI) *Deployer {
+	return newWithZips(cfg, ddb, s3c, iamc, lam, logs, apigw, cf, ecrc, nil)
 }
 
 // withZipReader installs a package loader, or leaves the default (os.ReadFile).
@@ -97,7 +99,7 @@ func withZipReader(f *lambdaFunc, read func(string) ([]byte, error)) *lambdaFunc
 
 // newWithZips is newWith with an injectable deployment-package loader, so the
 // rehearsal and the tests do not need `make lambdas` to have run.
-func newWithZips(cfg Config, ddb dynamoAPI, s3c s3FullAPI, iamc iamAPI, lam lambdaFullAPI, logs logsAPI, apigw apigwAPI, cf cloudfrontAPI, readZip func(string) ([]byte, error)) *Deployer {
+func newWithZips(cfg Config, ddb dynamoAPI, s3c s3FullAPI, iamc iamAPI, lam lambdaFullAPI, logs logsAPI, apigw apigwAPI, cf cloudfrontAPI, ecrc ecrAPI, readZip func(string) ([]byte, error)) *Deployer {
 	tableARN := sessionsTableARN(cfg.Region, cfg.AccountID, cfg.SessionsTable)
 	logGroupFor := func(name string) *logGroup {
 		return &logGroup{
@@ -133,6 +135,9 @@ func newWithZips(cfg Config, ddb dynamoAPI, s3c s3FullAPI, iamc iamAPI, lam lamb
 				// user cannot regenerate without re-running an experiment.
 				emptyOnRemove: true,
 			},
+			// The worker image's home. Early, with the other storage: the data plane
+			// cannot run a trace without it, and nothing else depends on it existing.
+			&workerRepo{api: ecrc, repo: cfg.WorkerRepo},
 			gatewayRole(iamc, tableARN),
 			webAPIRole(iamc, tableARN, cfg.DataBucket, cfg.AccountID, cfg.PlanModelID),
 			spawnRole(iamc, cfg.DataBucket, cfg.AccountID),

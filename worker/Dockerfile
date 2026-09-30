@@ -17,9 +17,17 @@
 # target is injected by the control plane at run time (FORAY_DEVICE), not baked in,
 # so the same image serves cuda today and neuron the day TorchNeuron GAs.
 #
-# Build:  docker build -t foray-worker:dev -f worker/Dockerfile .
-# Run:    docker run --gpus all -e FORAY_SESSION_ID=... -e FORAY_MODEL_URI=... \
-#                    -e FORAY_SAVE_BUCKET=... -p 8000:8000 foray-worker:dev
+# This image is how the worker reaches the GPU: `spawn task run` pulls it from ECR
+# onto an instance whose AMI carries the NVIDIA driver, stages the graph in, and runs
+# `python3 -m worker.batch` (issue #103). Before that, nothing put the worker on the
+# instance at all and no real trace could run.
+#
+# Build + publish:  make worker-push     (builds linux/amd64, pushes to ECR)
+# Build only:       docker build -t foray-worker:dev -f worker/Dockerfile .
+# Run one trace by hand, as the task does:
+#   docker run --gpus all -e FORAY_SESSION_ID=... -e FORAY_MODEL_URI=... \
+#     -e FORAY_SAVE_BUCKET=... -v /tmp/graph.json:/tmp/graph.json \
+#     foray-worker:dev python3 -m worker.batch
 
 # CUDA + cuDNN runtime base; torch wheels bring their own CUDA libs but the GDS
 # (cuFile) fast path wants the system CUDA runtime present.
@@ -62,11 +70,10 @@ COPY worker/ ./worker/
 EXPOSE 8000
 # Single-tenant: the user's own code on the user's own GPU; no sandbox layer.
 #
-# This default serves on 0.0.0.0 for a container reached over a published port
-# (`docker run -p 8000:8000`), which is the manual smoke shape. It is NOT how the
-# CLI runs the worker: under `spawn service` (#66) foray runs
-# `python3 -m worker.serve`, which binds loopback and announces its port. Running
-# that inside a container needs host networking so the tunnel can reach it:
-#
-#   docker run --network host --gpus all foray-worker:dev python -m worker.serve
+# The default CMD is the HTTP server, for reaching a container over a published port
+# — the manual smoke shape and local development. It is NOT how foray runs a rung:
+# `spawn task run` passes `python3 -m worker.batch` as the command, which replaces
+# this, reads the staged /tmp/graph.json, runs exactly one trace, writes
+# /tmp/result.json and exits. Keeping the server as the default is deliberate: an
+# image whose default did nothing but exit would be confusing to run by hand.
 CMD ["uvicorn", "worker.app:app", "--host", "0.0.0.0", "--port", "8000"]

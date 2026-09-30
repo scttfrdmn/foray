@@ -15,8 +15,10 @@
 package gateway
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"io"
 	"os"
 	"os/exec"
 	"strings"
@@ -28,7 +30,7 @@ import (
 )
 
 // A manual, opt-in integration test of the launch-time handoff contract against real
-// S3 and the real worker (#66). Never run in CI — same precedent as
+// S3 and the real worker (#66, #103). Never run in CI — same precedent as
 // `make worker-smoke`.
 //
 //	FORAY_LIVE_HANDOFF=1 FORAY_DATA_BUCKET=<bucket> AWS_PROFILE=aws \
@@ -41,9 +43,16 @@ import (
 // real-AWS validations in this repo each found bugs that offline tests could not
 // (PRs #97, #99).
 //
+// Since the data plane moved to `spawn task run`, the two S3 hops in the middle are
+// spawn's staging rather than the worker's own I/O, so this test performs them itself —
+// fetching graph.json to a local file before running the worker and uploading the file the
+// worker wrote. That is deliberately the *same* GetObject/PutObject spawn's wrapper does
+// (`aws s3 cp`), so what is under test is still the contract: the key the graph is written
+// to, the envelope's encoding, and the result document the control plane reads back.
+//
 // It needs no GPU: the worker runs under FORAY_FAKE=1, which exercises the whole
-// handoff path — fetch the graph, route it, write the result — with the nnsight/CUDA
-// step short-circuited. The GPU half is worker-smoke's job.
+// handoff path with the nnsight/CUDA step short-circuited. The GPU half is
+// worker-smoke's job, and an end-to-end `spawn task run` is make worker-push's.
 func TestLiveHandoffRoundTrip(t *testing.T) {
 	if os.Getenv("FORAY_LIVE_HANDOFF") != "1" {
 		t.Skip("manual: set FORAY_LIVE_HANDOFF=1 with FORAY_DATA_BUCKET and AWS credentials")
@@ -81,8 +90,13 @@ func TestLiveHandoffRoundTrip(t *testing.T) {
 	}
 	t.Logf("wrote %s", graphKey(session))
 
-	// 3. Run the real worker against the real bucket. FORAY_FAKE=1 keeps the GPU out of
-	//    it; everything about the handoff — reading the envelope, routing, writing the
+	// 3. Stage the graph in, as spawn's wrapper does before the container execs.
+	dir := t.TempDir()
+	graphPath, resultPath := dir+"/graph.json", dir+"/result.json"
+	stageIn(t, ctx, s3.NewFromConfig(awsCfg), bucket, graphKey(session), graphPath)
+
+	// 4. Run the real worker on the staged file. FORAY_FAKE=1 keeps the GPU out of it;
+	//    everything about the handoff — decoding the envelope, routing, writing the
 	//    result — is the production path.
 	cmd := exec.CommandContext(ctx, "uv", "run", "--project", "worker", "python", "-m", "worker.batch")
 	cmd.Dir = "../.."
@@ -91,6 +105,8 @@ func TestLiveHandoffRoundTrip(t *testing.T) {
 		"FORAY_SESSION_ID="+session,
 		"FORAY_SAVE_BUCKET="+bucket,
 		"FORAY_SAVE_REGION="+awsCfg.Region,
+		"FORAY_GRAPH_PATH="+graphPath,
+		"FORAY_RESULT_PATH="+resultPath,
 	)
 	out, err := cmd.CombinedOutput()
 	t.Logf("worker output:\n%s", out)
@@ -98,7 +114,10 @@ func TestLiveHandoffRoundTrip(t *testing.T) {
 		t.Fatalf("worker.batch failed: %v", err)
 	}
 
-	// 4. Collect it, exactly as /api/result does.
+	// 5. Stage the result out, as spawn's wrapper does after the container exits.
+	stageOut(t, ctx, s3.NewFromConfig(awsCfg), bucket, resultKey(session), resultPath)
+
+	// 6. Collect it, exactly as /api/result does.
 	res, pending, err := h.GetResult(ctx, session)
 	if err != nil {
 		t.Fatalf("GetResult after the worker ran: %v", err)
@@ -143,6 +162,10 @@ func TestLiveHandoffRecordsFailure(t *testing.T) {
 		t.Fatalf("PutGraph: %v", err)
 	}
 
+	dir := t.TempDir()
+	graphPath, resultPath := dir+"/graph.json", dir+"/result.json"
+	stageIn(t, ctx, s3.NewFromConfig(awsCfg), bucket, graphKey(session), graphPath)
+
 	cmd := exec.CommandContext(ctx, "uv", "run", "--project", "worker", "python", "-m", "worker.batch")
 	cmd.Dir = "../.."
 	cmd.Env = append(os.Environ(),
@@ -150,9 +173,15 @@ func TestLiveHandoffRecordsFailure(t *testing.T) {
 		"FORAY_SESSION_ID="+session,
 		"FORAY_SAVE_BUCKET="+bucket,
 		"FORAY_SAVE_REGION="+awsCfg.Region,
+		"FORAY_GRAPH_PATH="+graphPath,
+		"FORAY_RESULT_PATH="+resultPath,
 	)
 	out, _ := cmd.CombinedOutput() // a refused graph exits non-zero, which is correct
 	t.Logf("worker output:\n%s", out)
+
+	// spawn stages declared outputs out even when the command failed (a deliberate
+	// `set +e` in its wrapper), which is what makes the worker's error result reachable.
+	stageOut(t, ctx, s3.NewFromConfig(awsCfg), bucket, resultKey(session), resultPath)
 
 	_, pending, err := h.GetResult(ctx, session)
 	if pending {
@@ -162,4 +191,36 @@ func TestLiveHandoffRecordsFailure(t *testing.T) {
 		t.Fatalf("err = %v, want ErrTraceFailed carrying the worker's reason", err)
 	}
 	t.Logf("failure surfaced: %v", err)
+}
+
+// stageIn and stageOut stand in for spawn's wrapper, which copies a task's declared
+// inputs and outputs with `aws s3 cp` around the container run. Same two API calls, so
+// the contract under test is unchanged — only who performs them.
+func stageIn(t *testing.T, ctx context.Context, c *s3.Client, bucket, key, path string) {
+	t.Helper()
+	out, err := c.GetObject(ctx, &s3.GetObjectInput{Bucket: &bucket, Key: &key})
+	if err != nil {
+		t.Fatalf("stage in s3://%s/%s: %v", bucket, key, err)
+	}
+	defer func() { _ = out.Body.Close() }()
+	body, err := io.ReadAll(out.Body)
+	if err != nil {
+		t.Fatalf("read %s: %v", key, err)
+	}
+	if err := os.WriteFile(path, body, 0o600); err != nil {
+		t.Fatalf("write %s: %v", path, err)
+	}
+}
+
+func stageOut(t *testing.T, ctx context.Context, c *s3.Client, bucket, key, path string) {
+	t.Helper()
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("the worker wrote no %s: %v", path, err)
+	}
+	if _, err := c.PutObject(ctx, &s3.PutObjectInput{
+		Bucket: &bucket, Key: &key, Body: bytes.NewReader(body),
+	}); err != nil {
+		t.Fatalf("stage out s3://%s/%s: %v", bucket, key, err)
+	}
 }

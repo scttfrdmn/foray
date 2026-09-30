@@ -23,13 +23,17 @@ import (
 	"github.com/scttfrdmn/foray/internal/sizing"
 )
 
-// countingExecutor records how many times a rung was actually launched, so the
-// invariant tests can prove nothing runs without an explicit Approve.
-type countingExecutor struct{ launches int }
+// countingExecutor records how many times a rung was actually launched, and under which
+// session ids, so the invariant tests can prove nothing runs without an explicit Approve.
+type countingExecutor struct {
+	launches int
+	sessions []string
+}
 
-func (e *countingExecutor) Execute(_ context.Context, _ Question, r *Rung) (string, error) {
+func (e *countingExecutor) Execute(_ context.Context, _ Question, _ *Rung, sessionID string) error {
 	e.launches++
-	return "sess", nil
+	e.sessions = append(e.sessions, sessionID)
+	return nil
 }
 
 // TestNoAutoClimbOrAutoLaunch enforces "the brain proposes and interprets; it
@@ -71,11 +75,60 @@ func TestNoAutoClimbOrAutoLaunch(t *testing.T) {
 	}
 
 	// Only Approve launches.
-	if _, err := b.Approve(ctx, ladder, prop); err != nil {
+	sid := NewSessionID(prop.Rung)
+	if err := b.Approve(ctx, ladder, prop, sid); err != nil {
 		t.Fatal(err)
 	}
 	if exec.launches != 1 {
 		t.Fatalf("after one Approve, launches = %d, want 1", exec.launches)
+	}
+	// The caller's id is what launched, not one the executor invented: the graph was
+	// already staged under it before Approve was called (#103).
+	if len(exec.sessions) != 1 || exec.sessions[0] != sid {
+		t.Errorf("launched under %v, want the caller's id %q", exec.sessions, sid)
+	}
+}
+
+// Approve without a session id must refuse rather than launch. A rung launched under an
+// id nobody staged a graph for is an instance that boots, finds nothing, and bills.
+func TestApproveRequiresASessionID(t *testing.T) {
+	ctx := context.Background()
+	exec := &countingExecutor{}
+	b := &Brain{Plan: fakePlanner{}, Policy: fakePolicy{}, Exec: exec}
+	ladder, prop, err := b.Propose(ctx, "q")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, sid := range []string{"", "   "} {
+		if err := b.Approve(ctx, ladder, prop, sid); err == nil {
+			t.Errorf("Approve(%q) should refuse: nothing staged the graph", sid)
+		}
+	}
+	if exec.launches != 0 {
+		t.Fatalf("an id-less Approve launched %d rungs; it must launch none", exec.launches)
+	}
+}
+
+// NewSessionID must be unique per call and carry the rung and model, because it doubles
+// as the task id and therefore the instance's Name tag — the handle `foray sessions`,
+// `foray stop` and export ownership all resolve from.
+func TestNewSessionIDIsUniqueAndDescriptive(t *testing.T) {
+	r := &Rung{Index: 1, Model: sizing.Model{Name: "openai-community/gpt2"}}
+	seen := map[string]bool{}
+	for i := 0; i < 100; i++ {
+		id := NewSessionID(r)
+		if seen[id] {
+			t.Fatalf("NewSessionID repeated %q — two sessions would share a bucket prefix", id)
+		}
+		seen[id] = true
+		for _, want := range []string{"foray-", "r1", "gpt2"} {
+			if !strings.Contains(id, want) {
+				t.Errorf("id %q should contain %q", id, want)
+			}
+		}
+		if strings.ContainsAny(id, "/ ") {
+			t.Errorf("id %q must be safe as an S3 key segment and an EC2 Name tag", id)
+		}
 	}
 }
 
@@ -105,7 +158,7 @@ func TestApproveRefusesOverCeiling(t *testing.T) {
 			Chosen:      sizing.Option{Tier: device.TierSmall, Backend: device.BackendNVIDIA},
 		}},
 	}
-	_, err = b.Approve(ctx, ladder, &Proposal{Rung: &ladder.Rungs[0]})
+	err = b.Approve(ctx, ladder, &Proposal{Rung: &ladder.Rungs[0]}, "foray-test-session")
 	if err == nil {
 		t.Fatal("Approve should refuse a rung over the Cedar ceiling")
 	}
@@ -162,7 +215,7 @@ func TestEnvelopeAndCeilingAreDistinct(t *testing.T) {
 		l.Question.BudgetUSD = 0.50 // can afford rung 0 but not rung 0+1
 
 		// Approve rung 0 (Cedar permits: $0.10 <= $5).
-		if _, err := b.Approve(ctx, l, &Proposal{Rung: &l.Rungs[0]}); err != nil {
+		if err := b.Approve(ctx, l, &Proposal{Rung: &l.Rungs[0]}, "foray-test-r0"); err != nil {
 			t.Fatalf("rung 0 should be permitted by Cedar: %v", err)
 		}
 		// Cedar WOULD permit rung 1 ($1.00 <= $5)...
@@ -189,7 +242,7 @@ func TestEnvelopeAndCeilingAreDistinct(t *testing.T) {
 		b := &Brain{Plan: fakePlanner{}, Policy: pol, Exec: exec}
 		l := newLadder() // envelope $5 — plenty for both rungs combined
 
-		if _, err := b.Approve(ctx, l, &Proposal{Rung: &l.Rungs[0]}); err != nil {
+		if err := b.Approve(ctx, l, &Proposal{Rung: &l.Rungs[0]}, "foray-test-r0"); err != nil {
 			t.Fatalf("rung 0 within ceiling should be permitted: %v", err)
 		}
 		// The envelope alone would happily climb ($0.10 + $1.00 <= $5)...
@@ -198,7 +251,7 @@ func TestEnvelopeAndCeilingAreDistinct(t *testing.T) {
 			t.Fatalf("envelope has room; Assess should recommend Climb, got %s", rec.Decision)
 		}
 		// ...but Cedar's per-session ceiling denies rung 1 at Approve.
-		_, err := b.Approve(ctx, l, &Proposal{Rung: &l.Rungs[1]})
+		err := b.Approve(ctx, l, &Proposal{Rung: &l.Rungs[1]}, "foray-test-r1")
 		if err == nil {
 			t.Fatal("ceiling should deny rung 1 at Approve")
 		}

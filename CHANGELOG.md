@@ -11,7 +11,72 @@ prefix.
 
 ## [Unreleased]
 
+### Changed
+
+- **BREAKING: the data plane runs on `spawn task run` (#103).** A rung is no longer a
+  bare instance foray launches and then tries to reach — it is a spawn *task*: a
+  container image, staged inputs, staged outputs, and a lifecycle. This closes the gap
+  that made no real trace runnable, and it is the project's own reuse rule applied late
+  (CLAUDE.md: "if you find yourself writing an instance launcher, stop — call the tool").
+
+  What foray was missing, and `spawn task run` already had:
+
+  - **Container delivery.** foray never specified an AMI or an image, so the instance
+    booted plain AL2023 and `python3 -m worker.batch` failed with `No module named
+    worker` — no torch, no nnsight, no worker package. A task launches from an ECR
+    image, and for a GPU instance type spawn auto-selects the driver-bearing AMI.
+  - **Inputs staged before exec.** The graph is a local file by the time the container
+    starts, so `worker/batch.py` no longer polls S3 for its own input (it waited up to
+    120s) and no longer needs boto3 for the handoff at all.
+  - **A completion record written even on failure.** spawn's wrapper writes
+    `completion.json` and `.exitcode` after a deliberate `set +e`. That is the signal
+    foray had no equivalent of: `batch.py` records a trace that *raises*, but nothing
+    recorded a container that never reached Python — a bad image, a failed pull, an OOM
+    during model load. `Gateway.Collect` now consults it, so "died without writing a
+    result" is a reported failure instead of a poll that never ends. Race-free because
+    spawn stages outputs out *before* writing the record (verified in its wrapper, not
+    assumed): a record plus a missing result means the result is not coming.
+  - **`on_complete: terminate`.** It fires on the completion signal's existence, so it
+    reaps a failed task too. foray's own end-of-rung terminate is now a backstop rather
+    than the mechanism.
+
+  Consequences worth knowing:
+
+  - **The session id is minted by the caller, before anything launches.**
+    `Brain.Approve` takes one and returns only an error; `brain.NewSessionID` builds it.
+    The graph must exist at `sessions/<id>/graph.json` for the task to stage it, so the
+    id has to precede the instance. It becomes the task id and therefore the instance's
+    `Name` tag, which is how `foray sessions`, `foray stop` and export ownership resolve
+    a session — spawn resolves a non-`i-` identifier by name, so this holds.
+  - **The CLI no longer opens an SSH forward.** `foray run` uses the same `HandOff` +
+    `Collect` the deployed page does. The `spawn service` tunnel could not survive the
+    task path — spawn starts the container itself from the spec's command, so there is
+    no listener to hand a graph to over HTTP.
+  - **`--keep` means *stopped*, not *running*.** No `on_complete` value leaves an
+    instance up, so the flag now maps to `stop`: the root volume survives for
+    inspection and bills until TTL. Terminate remains the default.
+  - **Staged paths are flat and in `/tmp`** (`/tmp/graph.json`, `/tmp/result.json`), not
+    a tidier `/data` + `/work`. spawn bind-mounts a staged path's parent as the instance
+    user while `docker run` gets no `--user`, and an output path's parent is created as
+    root — so `/tmp` (mode 1777) is the only reliably writable location, and spawn's own
+    example layout cannot work (spore-host/spawn#555, via scientific-codes-cookbook).
+    `internal/spore` refuses a spec that breaks this, before any AWS call.
+  - **The task declares `s3_read_write` on the data bucket.** The staging manifests only
+    cover the graph and the result; the worker's *saves* are S3 I/O no manifest sees, so
+    without the grant a trace would run and then fail writing the activations it was for.
+  - **The root disk is sized from the model.** spawn floors a `disk_gib` request at the
+    AMI's own snapshot size, so asking cannot fail a launch — while leaving it unset
+    means spawn's 20 GiB default plus whatever the AMI floor happens to be, which says
+    nothing about room for a 70B download.
+
 ### Fixed
+
+- **The spore fake modelled instance lookup by id only.** Real spawn resolves any
+  identifier not starting with `i-` as a case-insensitive `Name` match, which is exactly
+  how foray addresses a session. The fake's stricter behaviour made every rung's reap
+  report a failure — and would have hidden the reverse mistake completely. Same class of
+  bug as the adapter drift in #79: a hand-written fake encoding a belief about a tool
+  rather than the tool.
 
 - `internal/deploy`: two bugs found hand-validating `foray deploy` against a real
   account (#85) — the first deploy of the verb, and both were invisible offline.
@@ -35,6 +100,18 @@ prefix.
     precisely the implicitly-created, retains-forever group this code exists to fix.
 
 ### Added
+
+- **An ECR repository for the worker image, on both deployment paths (#103).**
+  `foray deploy` creates `foray-worker` (scan-on-push, images deleted with the
+  repository on teardown) and `deploy/terraform/storage.tf` mirrors it. A lifecycle
+  policy expires untagged layers after a day and keeps five tagged images: of
+  everything the control plane provisions this is the one resource that grows with use,
+  and unbounded it would slowly become the largest line on a bill that is supposed to
+  rest at ~$0.
+- **`make worker-push`** — build `linux/amd64`, log in to ECR, push, and print the
+  `FORAY_WORKER_IMAGE` to export. `foray deploy` now ends by pointing at it, because a
+  control plane without a published image cannot run a trace; a rung refuses to launch
+  without one rather than starting a GPU with nothing on it.
 
 - **`foray deploy`: CloudFront and the SPA upload — #85 increment 4, completing the
   verb.** `foray deploy` now provisions the whole control plane end to end.

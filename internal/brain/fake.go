@@ -26,26 +26,42 @@ import (
 // CI gate (make demo-fake). The findings are canned but honest in shape: the
 // cheap rung shows the effect, the next confirms it scales.
 
-// NewFake builds a Brain wired with offline collaborators. It launches through a
-// fresh spore fake spawn so the executor produces real, lookup-able session ids
-// (the CLI's gateway tracer resolves them via Spawn.Status).
+// NewFake builds a Brain wired with offline collaborators over a fresh spore fake.
 func NewFake() *Brain {
-	return NewFakeWith(spore.NewFake().Spawn)
+	f := spore.NewFake()
+	return NewFakeWith(f.Task, f.Spawn)
 }
 
-// NewFakeWith builds the offline Brain over a caller-supplied spawn so the CLI
-// can share one fake spawn between the brain's SpawnExecutor and the gateway's
-// idle bridge — the launched session then exists for KeepWarm/Status. The
-// planner, policy, and interpreter stay canned; only the executor is real, so
-// the offline loop exercises the same SpawnExecutor code the real path uses.
-func NewFakeWith(sp spore.Spawn) *Brain {
+// NewFakeWith builds the offline Brain over caller-supplied spore fakes so the CLI can
+// share one fake between the brain's SpawnExecutor and the gateway's collector — the
+// launched task then exists for Status. The planner, policy, and interpreter stay canned;
+// only the executor is real, so the offline loop exercises the same SpawnExecutor code
+// the real path uses, including its spec validation.
+//
+// The image and bucket are placeholders, but non-empty ones: Execute refuses a spec with
+// neither, and a fake that skipped that check would let `make demo-fake` pass a launch
+// the real path rejects.
+func NewFakeWith(t spore.Task, sp spore.Spawn) *Brain {
 	return &Brain{
 		Plan:   fakePlanner{},
 		Policy: fakePolicy{},
-		Exec:   SpawnExecutor{Spawn: sp},
+		Exec: SpawnExecutor{
+			Task:        t,
+			Spawn:       sp,
+			WorkerImage: FakeWorkerImage,
+			DataBucket:  FakeDataBucket,
+			Device:      "cuda",
+		},
 		Interp: fakeInterpreter{},
 	}
 }
+
+// FakeWorkerImage and FakeDataBucket are the offline stand-ins for the two things the
+// real launch cannot do without. Named so a test can assert on the generated spec.
+const (
+	FakeWorkerImage = "000000000000.dkr.ecr.us-west-2.amazonaws.com/foray-worker:fake"
+	FakeDataBucket  = "foray-fake-data"
+)
 
 type fakePlanner struct{}
 

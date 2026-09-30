@@ -56,6 +56,8 @@ class Settings:
     save_bucket: str  # S3 bucket for saved activations (in-region, no egress)
     save_region: str  # bucket region; asserted in-region by the control plane
     default_engine: str  # "eager" (universal) unless the launch overrides it
+    graph_path: str  # local file `spawn task run` staged the graph into, before exec
+    result_path: str  # local file to write the result to; spawn stages it out after exit
 
     @property
     def save_prefix(self) -> str:
@@ -74,4 +76,9 @@ def load() -> Settings:
         save_bucket=os.environ.get("FORAY_SAVE_BUCKET", "your-bucket-us-east-1"),
         save_region=os.environ.get("FORAY_SAVE_REGION", "us-east-1"),
         default_engine=os.environ.get("FORAY_DEFAULT_ENGINE", "eager").strip().lower(),
+        # Flat paths in /tmp, matching the task spec's staging manifests: spawn
+        # bind-mounts a staged path's parent as the instance user while `docker run` gets
+        # no --user, so only /tmp (1777) is reliably writable (spore-host/spawn#555).
+        graph_path=os.environ.get("FORAY_GRAPH_PATH", "/tmp/graph.json"),
+        result_path=os.environ.get("FORAY_RESULT_PATH", "/tmp/result.json"),
     )

@@ -32,7 +32,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"net/http"
 	"os"
 	"strconv"
 	"strings"
@@ -124,11 +123,11 @@ func runCmd(ctx context.Context, args []string) {
 		hardware  = fs.String("hardware", "", "override instance type, e.g. g7e.xlarge (else the smallest tier)")
 		budget    = fs.Float64("budget", 0, "per-question budget envelope in USD (the ladder is capped here)")
 		yes       = fs.Bool("yes", false, "approve every rung without prompting (pre-authorizes the whole climb)")
-		keep      = fs.Bool("keep", false, "leave each rung's instance running instead of terminating it when the rung ends (idle still stops it, TTL still terminates it)")
+		keep      = fs.Bool("keep", false, "leave each rung's instance stopped instead of terminated, so its disk can be inspected (its EBS bills until TTL terminates it)")
 	)
 	question := parseWithPositionals(fs, args)
 
-	d, err := buildDeps(*budget)
+	d, err := buildDeps(depsOpts{budgetUSD: *budget, keep: *keep, dataPlane: true})
 	if err != nil {
 		die(err)
 	}
@@ -180,14 +179,20 @@ func runLoop(ctx context.Context, d *deps, ladder *brain.Ladder, prop *brain.Pro
 			break
 		}
 
+		// The session's identity comes first: the graph is staged into the task from
+		// sessions/<id>/, so the id has to exist before the instance does (#103).
+		sid := brain.NewSessionID(prop.Rung)
+		if err := d.collector.handOff(ctx, sid, prop.Rung); err != nil {
+			die(err)
+		}
+
 		// Approve is the sole acceptance node: it runs Cedar, then launches.
-		sid, err := d.brain.Approve(ctx, ladder, prop)
-		if err != nil {
+		if err := d.brain.Approve(ctx, ladder, prop, sid); err != nil {
 			die(err) // Cedar denials surface here with the policy reason verbatim.
 		}
 		fmt.Printf("  Go — launched session %s on %s\n", sid, prop.Rung.Chosen.InstanceType)
 
-		tr, err := runRung(ctx, d, sid, prop.Rung, keep)
+		tr, err := runRung(ctx, d, sid, keep)
 		if err != nil {
 			die(err)
 		}
@@ -304,7 +309,7 @@ func modelsCmd(args []string) {
 // honestly reports none.
 func sessionsCmd(ctx context.Context, args []string) {
 	_ = args
-	d, err := buildDeps(0)
+	d, err := buildDeps(depsOpts{})
 	if err != nil {
 		die(err)
 	}
@@ -340,7 +345,7 @@ func stopCmd(ctx context.Context, args []string) {
 		fmt.Fprintln(os.Stderr, "usage: foray stop <session> [--force]")
 		os.Exit(2)
 	}
-	d, err := buildDeps(0)
+	d, err := buildDeps(depsOpts{})
 	if err != nil {
 		die(err)
 	}
@@ -389,7 +394,7 @@ func buildExporter(ctx context.Context, session string) (*export.Exporter, error
 	if spore.Enabled() {
 		return export.NewFake(), nil
 	}
-	d, err := buildRealDeps(0)
+	d, err := buildRealDeps(depsOpts{})
 	if err != nil {
 		return nil, err
 	}
@@ -430,7 +435,7 @@ type deps struct {
 	truffle   spore.Truffle
 	principal brain.Principal
 	region    string
-	tracer    *tracer
+	collector *collector
 }
 
 // regionScope returns the truffle/pricing region scope, or nil to let truffle
@@ -442,174 +447,178 @@ func (d *deps) regionScope() []string {
 	return []string{d.region}
 }
 
-// runRung does one approved rung's data-plane work: open a tunnel to the worker,
-// trace, then tear the session down.
+// runRung waits for the approved rung's result, then makes sure nothing is left
+// billing.
 //
-// It exists as a function rather than inline in runLoop so cleanup can be
-// deferred. Cleanup is the whole point: the instance exists from the moment
-// Approve returns, so *every* exit path from here — including a failed trace —
-// has to close the tunnel and reap the instance. runLoop reports errors through
-// die(), which calls os.Exit and therefore runs no defers, so the cleanup has to
-// finish before the error gets there.
-//
-// Order is LIFO and deliberate: close the tunnel first, then terminate the
-// instance it pointed at.
-func runRung(ctx context.Context, d *deps, sid string, r *brain.Rung, keep bool) (gateway.TraceResult, error) {
+// It exists as a function rather than inline in runLoop so cleanup can be deferred.
+// Cleanup is the whole point: the instance exists from the moment Approve returns, so
+// *every* exit path from here — including a failed trace — has to reap it. runLoop
+// reports errors through die(), which calls os.Exit and therefore runs no defers, so the
+// cleanup has to finish before the error gets there.
+func runRung(ctx context.Context, d *deps, sid string, keep bool) (gateway.TraceResult, error) {
 	defer reap(ctx, d, sid, keep)
-
-	// register maps the session→worker (opening the spawn service tunnel); trace
-	// routes the graph and bridges the idle signal; only references come back,
-	// never tensors.
-	if err := d.tracer.register(ctx, sid, r); err != nil {
-		return gateway.TraceResult{}, fmt.Errorf("register session: %w", err)
-	}
-	defer func() {
-		if cerr := d.tracer.close(); cerr != nil {
-			fmt.Fprintf(os.Stderr, "  note: closing the worker tunnel for %s: %v\n", sid, cerr)
-		}
-	}()
-
-	tr, err := d.tracer.trace(ctx, sid, r)
-	if err != nil {
-		return gateway.TraceResult{}, fmt.Errorf("trace session %s: %w", sid, err)
-	}
-	return tr, nil
+	return d.collector.await(ctx, sid)
 }
 
-// reap terminates the session's instance, which is what actually reaches $0.
+// reap terminates the session's instance. It is now a backstop rather than the
+// mechanism: the task's own `on_complete: terminate` fires on the completion signal —
+// including for a failed task — so by the time a rung's result is in hand, spawn has
+// usually already reaped the instance. This covers what escapes that: a task that never
+// wrote a completion signal at all, and the caller who gave up waiting.
 //
-// spawn's idle timeout only *stops* an instance — it never terminates one, and a
-// stopped instance keeps billing its EBS volumes until TTL (issue #80). Since the
-// control plane knows precisely when a rung is done, it terminates then rather
-// than leaving an idle box billing storage for the rest of its TTL. Idle and TTL
-// remain the backstops for anything that escapes this path.
+// It stays because spawn's *idle* timeout only stops an instance, and a stopped instance
+// keeps billing its EBS volumes until TTL (issue #80). Terminating when the control plane
+// knows the rung is done is still the only thing that reaches $0 promptly.
 //
-// A failed termination is reported, not fatal: the rung's result is already in
-// hand, and TTL still bounds the instance. Telling the user which session to clean
-// up by hand beats discarding their finding.
+// A failed termination is reported, not fatal: the rung's result is already in hand, and
+// TTL still bounds the instance. Telling the user which session to clean up by hand beats
+// discarding their finding. An already-terminated instance lands here too, which is the
+// common case — hence "could not" rather than an alarm.
 func reap(ctx context.Context, d *deps, sid string, keep bool) {
 	if keep {
-		fmt.Printf("    session %s left running (--keep); idle stops it, TTL terminates it.\n", sid)
+		fmt.Printf("    session %s left stopped (--keep); its disk bills until TTL terminates it.\n", sid)
 		fmt.Printf("    terminate it now with: foray stop %s\n", sid)
 		return
 	}
 	if err := d.spawn.Terminate(ctx, sid); err != nil {
 		fmt.Fprintf(os.Stderr,
-			"  note: could not terminate %s (%v) — TTL will still reap it; `foray stop %s` to be sure\n",
+			"  note: could not terminate %s (%v) — the task's on_complete and TTL both still reap it; `foray stop %s` to be sure\n",
 			sid, err, sid)
 	}
 }
 
-// tracer fetches a rung's result through the gateway library, in-process. It is
-// the CLI playing the role forayd plays as a Lambda: same Route, same idle bridge.
-type tracer struct {
-	gw     *gateway.Gateway
-	spawn  spore.Spawn
-	server spore.Server
-	device string
-
-	// svc is the current session's tunnel, held between register and close.
-	svc *spore.Service
-}
-
-// register starts the worker on the session's instance and opens a tunnel to it,
-// then maps the session so Route can resolve it (issue #66).
+// collector is the CLI's half of the launch-time handoff: write the graph where the task
+// will stage it from, then wait for the result the worker stages back (#66, #103).
 //
-// The worker is reached through `spawn service`, not over a public IP: it binds
-// the instance's loopback and only the SSH forward reaches it, so nothing is
-// exposed to the internet and no VPC/endpoint/NAT is needed to talk to it. The
-// URL spawn hands back is a localhost address carrying the worker's session
-// token; gateway.HTTPWorker splits the two apart.
-func (t *tracer) register(ctx context.Context, sid string, r *brain.Rung) error {
-	svc, err := t.server.Serve(ctx, spore.ServeSpec{
-		InstanceID: sid,
-		Command:    workerCommand(sid, r, t.device),
-	})
-	if err != nil {
-		return fmt.Errorf("open a tunnel to the worker on %s: %w", sid, err)
-	}
-	t.svc = svc
-	return t.gw.Store.Put(ctx, gateway.Session{
-		ID:         sid,
-		InstanceID: sid,
-		WorkerURL:  svc.URL,
-	})
+// It is the same gateway code the deployed control plane runs — HandOff and Collect — so
+// the CLI and the web app reach the worker the same way. The CLI used to be different: it
+// held an SSH forward through `spawn service` and POSTed the graph to a loopback listener.
+// That stopped being possible when the data plane moved to `spawn task run`, which starts
+// the container itself from the spec's command; there is no longer a worker sitting there
+// waiting to be handed a graph over HTTP.
+type collector struct {
+	gw *gateway.Gateway
+
+	// poll is how often to ask for the result, and wait is how long to keep asking.
+	// Both are generous: a cold GPU instance boots, pulls the worker image, and streams
+	// model weights before the trace even starts.
+	poll, wait time.Duration
 }
 
-// close tears down the session's tunnel. The instance itself is not touched —
-// its TTL and idle timeout own that, as they must: stopping a tunnel is a
-// request, and only the instance's own deadlines are a guarantee.
-func (t *tracer) close() error {
-	if t.svc == nil {
-		return nil
-	}
-	err := t.svc.Stop()
-	t.svc = nil
-	return err
-}
-
-// workerCommand is the argv `spawn service` runs on the instance. spawn
-// shell-quotes it and appends "--addr 127.0.0.1:0", so worker.serve binds a free
-// loopback port and announces it (see worker/serve.py).
+// handOff records the session and writes its graph, in that order — Touch needs a row.
 //
-// The session's configuration rides in front of the interpreter via env(1)
-// because `spawn service` has no --env flag — and it should not grow one for our
-// sake when the command is already a command.
-func workerCommand(sid string, r *brain.Rung, deviceTarget string) []string {
-	return []string{
-		"env",
-		"FORAY_SESSION_ID=" + sid,
-		"FORAY_MODEL_URI=" + r.Model.Name,
-		"FORAY_DEFAULT_ENGINE=" + string(r.Engine),
-		"FORAY_DEVICE=" + deviceTarget,
-		"FORAY_SAVE_BUCKET=" + os.Getenv("FORAY_DATA_BUCKET"),
-		"FORAY_SAVE_REGION=" + os.Getenv("AWS_REGION"),
-		"python3", "-m", "worker.serve",
+// The graph goes over *before* the launch, which is the inverse of the pre-#103 order and
+// the reason it is now safe: `spawn task run` stages inputs before the container execs,
+// so the object must already be there. It also means the worker never waits for its own
+// input, and a graph that fails to write costs nothing because no instance exists yet.
+func (c *collector) handOff(ctx context.Context, sid string, r *brain.Rung) error {
+	if err := c.gw.Store.Put(ctx, gateway.Session{ID: sid, InstanceID: sid}); err != nil {
+		return fmt.Errorf("register session %s: %w", sid, err)
 	}
-}
-
-// trace routes the rung's generated nnsight to the worker and returns the result
-// reference. The payload is the nnsight as bytes — the seam where real graph
-// serialization plugs in; the gateway treats it as opaque either way.
-func (t *tracer) trace(ctx context.Context, sid string, r *brain.Rung) (gateway.TraceResult, error) {
-	return t.gw.Route(ctx, sid, gateway.Graph{
+	if err := c.gw.HandOff(ctx, sid, gateway.Graph{
 		Engine:  string(r.Engine),
 		Payload: []byte(r.NNSight),
-	})
+	}); err != nil {
+		return fmt.Errorf("hand off the graph for %s: %w", sid, err)
+	}
+	return nil
 }
 
-// buildDeps wires the fake or real collaborators depending on FORAY_FAKE.
-func buildDeps(budgetUSD float64) (*deps, error) {
-	if spore.Enabled() {
-		return buildFakeDeps(budgetUSD)
+// await polls until the worker's result appears, the task dies, or the wait runs out.
+//
+// Polling an object rather than waiting on a callback: the instance has no inbound path,
+// and the result object appearing *is* the completion signal. Collect also consults the
+// task's completion record, so a container that died before writing anything ends the
+// wait with a reason instead of running it out.
+//
+// Giving up does not leave the instance running — runRung's deferred reap still fires, and
+// the task's own TTL and on_complete bound it regardless.
+func (c *collector) await(ctx context.Context, sid string) (gateway.TraceResult, error) {
+	interval, deadline := c.poll, c.wait
+	if interval <= 0 {
+		interval = defaultPollInterval
 	}
-	return buildRealDeps(budgetUSD)
+	if deadline <= 0 {
+		deadline = defaultTraceWait
+	}
+	ctx, cancel := context.WithTimeout(ctx, deadline)
+	defer cancel()
+
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		res, pending, err := c.gw.Collect(ctx, sid)
+		if err != nil {
+			return gateway.TraceResult{}, fmt.Errorf("trace session %s: %w", sid, err)
+		}
+		if !pending {
+			return res, nil
+		}
+		select {
+		case <-ctx.Done():
+			return gateway.TraceResult{}, fmt.Errorf(
+				"trace session %s: no result after %s (the instance is being reaped; "+
+					"`foray export %s` if the worker wrote saves before it stopped)", sid, deadline, sid)
+		case <-t.C:
+		}
+	}
+}
+
+// Poll cadence. Seconds of latency are irrelevant next to a GPU boot plus weight
+// streaming, and each poll is one small GetObject.
+const (
+	defaultPollInterval = 10 * time.Second
+	defaultTraceWait    = 45 * time.Minute
+)
+
+// buildDeps wires the fake or real collaborators depending on FORAY_FAKE.
+func buildDeps(o depsOpts) (*deps, error) {
+	if spore.Enabled() {
+		return buildFakeDeps(o)
+	}
+	return buildRealDeps(o)
+}
+
+// depsOpts is what a command wants from its collaborators. dataPlane separates the
+// commands that launch and collect (run) from the ones that only read or stop what is
+// already there (sessions, stop, export) — the latter must not demand a bucket or a
+// worker image they never touch.
+type depsOpts struct {
+	budgetUSD float64
+	keep      bool // --keep: stop rather than terminate at end of rung
+	dataPlane bool // this command runs a trace, so the handoff must be wired
 }
 
 // buildFakeDeps wires the offline path: a fake brain, a shared fake spawn (so the
 // brain's executor and the gateway's idle bridge see the same instance table),
 // and the gateway's canned worker. Zero AWS — the dev/rehearse path and CI gate.
-func buildFakeDeps(_ float64) (*deps, error) {
+func buildFakeDeps(_ depsOpts) (*deps, error) {
 	f := spore.NewFake()
-	b := brain.NewFakeWith(f.Spawn)
+	b := brain.NewFakeWith(f.Task, f.Spawn)
 	gw := &gateway.Gateway{
-		Store:  gateway.NewMemStore(),
-		Worker: gateway.NewFakeWorker(),
-		Spawn:  f.Spawn,
+		Store: gateway.NewMemStore(),
+		Spawn: f.Spawn,
+		// The same launch-time handoff the deployed path uses, so the rehearsal exercises
+		// the flow that actually runs. The fake reports pending once before answering,
+		// which keeps the polling branch from rotting.
+		Handoff: gateway.NewFakeHandoff(),
+		Task:    f.Task,
 	}
 	return &deps{
 		brain:     b,
 		spawn:     f.Spawn,
 		truffle:   f.Truffle,
 		principal: brain.Principal{Subject: envOr("FORAY_USER", "foray-user"), AllowExport: true},
-		tracer:    &tracer{gw: gw, spawn: f.Spawn, server: f.Server, device: envOr("FORAY_DEVICE", "cuda")},
+		// Poll immediately: the fake's one pending answer is the point, not the wait.
+		// make demo-fake is a CI gate and must not spend 10s asleep to prove it polls.
+		collector: &collector{gw: gw, poll: time.Millisecond, wait: 10 * time.Second},
 	}, nil
 }
 
 // buildRealDeps wires the real brain (Bedrock plan + Cedar + spawn), the spore
 // CLIs, and a gateway over the stdlib HTTP worker. Credentials and region resolve
 // via the standard AWS chain; the planning model is a US inference profile id.
-func buildRealDeps(budgetUSD float64) (*deps, error) {
+func buildRealDeps(o depsOpts) (*deps, error) {
 	ctx := context.Background()
 	cfg, err := config.LoadDefaultConfig(ctx)
 	if err != nil {
@@ -618,30 +627,40 @@ func buildRealDeps(budgetUSD float64) (*deps, error) {
 	modelID := envOr("FORAY_PLAN_MODEL", "us.anthropic.claude-sonnet-4-6")
 	invoker := brain.NewBedrockInvoker(bedrockruntime.NewFromConfig(cfg), modelID)
 
+	bucket := os.Getenv("FORAY_DATA_BUCKET")
+	if bucket == "" && o.dataPlane {
+		return nil, errors.New("FORAY_DATA_BUCKET is required to run a trace: the graph is staged " +
+			"from it and the worker writes its result and saves back to it (foray deploy creates it)")
+	}
+
 	runner := spore.NewExecRunner()
 	truffle := spore.NewTruffle(runner)
 	spawn := spore.NewSpawn(runner)
-	// The worker is reached through `spawn service`, which is a long-lived child
-	// process rather than a one-shot command, so it needs the Starter seam.
-	server := spore.NewServer(spore.NewExecStarter())
+	task := spore.NewTask(runner)
 	principal := buildPrincipal()
 
 	b, err := brain.NewReal(brain.Config{
-		Invoker:   invoker,
-		Truffle:   truffle,
-		Spawn:     spawn,
-		Principal: principal,
-		BudgetUSD: budgetUSD,
-		Region:    cfg.Region,
-		Spot:      true,
+		Invoker:     invoker,
+		Truffle:     truffle,
+		Task:        task,
+		Spawn:       spawn,
+		Principal:   principal,
+		BudgetUSD:   o.budgetUSD,
+		Region:      cfg.Region,
+		Spot:        true,
+		WorkerImage: os.Getenv("FORAY_WORKER_IMAGE"),
+		DataBucket:  bucket,
+		Device:      envOr("FORAY_DEVICE", "cuda"),
+		OnComplete:  onComplete(o.keep),
 	})
 	if err != nil {
 		return nil, err
 	}
 	gw := &gateway.Gateway{
-		Store:  gateway.NewMemStore(),
-		Worker: gateway.HTTPWorker{Client: &http.Client{Timeout: 10 * time.Minute}},
-		Spawn:  spawn,
+		Store:   gateway.NewMemStore(),
+		Spawn:   spawn,
+		Handoff: gateway.NewS3Handoff(s3.NewFromConfig(cfg), bucket),
+		Task:    task,
 	}
 	return &deps{
 		brain:     b,
@@ -649,8 +668,19 @@ func buildRealDeps(budgetUSD float64) (*deps, error) {
 		truffle:   truffle,
 		principal: principal,
 		region:    cfg.Region,
-		tracer:    &tracer{gw: gw, spawn: spawn, server: server, device: envOr("FORAY_DEVICE", "cuda")},
+		collector: &collector{gw: gw},
 	}, nil
+}
+
+// onComplete maps --keep onto the task's instance fate. Stopping is the most the task
+// path can offer: there is no on_complete that leaves an instance running, so --keep now
+// means "leave the root volume around to look at", with EBS billing until TTL as the
+// price. Not keeping means terminate, which is the ephemerality invariant.
+func onComplete(keep bool) string {
+	if keep {
+		return spore.TaskOnCompleteStop
+	}
+	return spore.TaskOnCompleteTerminate
 }
 
 // buildPrincipal reads the Cedar principal's budget/tier opt-ins from the

@@ -37,8 +37,8 @@ func TestFakeLadderWalk(t *testing.T) {
 		t.Fatalf("cursor should start at 0, got %d", ladder.Cursor)
 	}
 
-	sid, err := b.Approve(ctx, ladder, prop)
-	if err != nil {
+	sid := NewSessionID(prop.Rung)
+	if err := b.Approve(ctx, ladder, prop, sid); err != nil {
 		t.Fatal(err)
 	}
 	if ladder.Cursor != 1 {
@@ -60,7 +60,8 @@ func TestFakeLadderWalk(t *testing.T) {
 	if prop == nil {
 		t.Fatal("expected a proposal for the second rung")
 	}
-	sid, _ = b.Approve(ctx, ladder, prop)
+	sid = NewSessionID(prop.Rung)
+	_ = b.Approve(ctx, ladder, prop, sid)
 	if ladder.Cursor != 2 {
 		t.Fatalf("cursor should be 2 after the second rung, got %d", ladder.Cursor)
 	}
@@ -81,7 +82,8 @@ func TestBudgetEnvelopeStopsClimb(t *testing.T) {
 	// Afford only the first rung.
 	ladder.Question.BudgetUSD = ladder.Rungs[0].EstCostUSD + 0.001
 
-	sid, _ := b.Approve(ctx, ladder, prop)
+	sid := NewSessionID(prop.Rung)
+	_ = b.Approve(ctx, ladder, prop, sid)
 	rec, _ := b.Assess(ctx, ladder, FakeResult(sid, 0))
 	if rec.Decision != Stop {
 		t.Fatalf("budget envelope should force Stop, got %s (%s)", rec.Decision, rec.Reason)

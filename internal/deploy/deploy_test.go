@@ -32,9 +32,9 @@ func testConfig() Config {
 }
 
 // resourceCount is how many resources a full Apply touches: the sessions table, two
-// buckets, three IAM roles, the spawn instance profile, three log groups, two Lambda
-// functions, the HTTP API, the CDN and the SPA upload.
-const resourceCount = 15
+// buckets, the worker's ECR repository, three IAM roles, the spawn instance profile,
+// three log groups, two Lambda functions, the HTTP API, the CDN and the SPA upload.
+const resourceCount = 16
 
 // testFakes bundles the stand-ins so tests can reach whichever they assert on.
 type testFakes struct {
@@ -45,6 +45,7 @@ type testFakes struct {
 	logs  *fakeLogs
 	apigw *fakeAPIGW
 	cf    *fakeCloudFront
+	ecr   *fakeECR
 }
 
 // newTestDeployer builds the real resource list over fakes.
@@ -58,13 +59,14 @@ func newTestDeployer(t *testing.T, cfg Config) (*Deployer, *testFakes) {
 		logs:  newFakeLogs(),
 		apigw: newFakeAPIGW(),
 		cf:    newFakeCloudFront(),
+		ecr:   newFakeECR(),
 	}
 	cfg = mustValidate(t, cfg)
 	if cfg.LWALayerARN == "" {
 		cfg.LWALayerARN = lwaLayerBase(cfg.Region) + ":25"
 	}
 	zip := func(path string) ([]byte, error) { return []byte("zip:" + path), nil }
-	d := newWithZips(cfg, f.ddb, f.s3, f.iam, f.lam, f.logs, f.apigw, f.cf, zip)
+	d := newWithZips(cfg, f.ddb, f.s3, f.iam, f.lam, f.logs, f.apigw, f.cf, f.ecr, zip)
 	// No web/ tree on disk in a unit test, and no sitting through a modeled
 	// CloudFront propagation.
 	for _, r := range d.resources {
